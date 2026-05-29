@@ -12,7 +12,9 @@ hermetic ``env -i`` subprocess, so no ambient credentials leak in.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ PLUGIN_NAME = "hermes-bug-vision-ticket"
 TOOL_NAME = "report_bug_from_screenshot"
 TOOLSET = "bug_vision_ticket"
 # How the host imports the package: slug = name with '/'->'__', '-'->'_'.
+NS_PARENT = "hermes_plugins"
 NS_MODULE = "hermes_plugins.hermes_bug_vision_ticket"
 
 
@@ -32,6 +35,36 @@ def _purge_plugin_modules() -> None:
     for name in list(sys.modules):
         if name == NS_MODULE or name.startswith(NS_MODULE + "."):
             sys.modules.pop(name, None)
+
+
+def _bootstrap_plugin_package() -> None:
+    """Import the plugin package as ``hermes_plugins.hermes_bug_vision_ticket``.
+
+    Mirrors hermes_cli.plugins._load_directory_module so unit tests can do
+    ``from hermes_plugins.hermes_bug_vision_ticket import vision`` (with working
+    intra-package relative imports) WITHOUT going through full plugin discovery.
+    Runs at conftest import — before pytest collects the test modules in this
+    directory — so the package is present when they import it.
+    """
+    if NS_MODULE in sys.modules:
+        return
+    if NS_PARENT not in sys.modules:
+        ns = types.ModuleType(NS_PARENT)
+        ns.__path__ = []  # namespace package
+        ns.__package__ = NS_PARENT
+        sys.modules[NS_PARENT] = ns
+    init = PLUGIN_DIR / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        NS_MODULE, init, submodule_search_locations=[str(PLUGIN_DIR)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = NS_MODULE
+    module.__path__ = [str(PLUGIN_DIR)]
+    sys.modules[NS_MODULE] = module
+    spec.loader.exec_module(module)
+
+
+_bootstrap_plugin_package()
 
 
 @pytest.fixture
