@@ -87,7 +87,11 @@ def test_structured_call_is_shaped_correctly(tmp_path):
     assert call["json_schema"] is BUG_REPORT_INPUT_SCHEMA
     assert "required" not in BUG_REPORT_INPUT_SCHEMA  # host must not pre-reject
     assert BUG_REPORT_INPUT_SCHEMA["additionalProperties"] is True
-    assert "enum" not in BUG_REPORT_INPUT_SCHEMA["properties"]["severity"]
+    # No per-field enum OR type constraint: the host must accept off-enum AND
+    # off-type output for _normalize to coerce (re-tightening either re-breaks it).
+    sev = BUG_REPORT_INPUT_SCHEMA["properties"]["severity"]
+    assert "enum" not in sev and "type" not in sev
+    assert "type" not in BUG_REPORT_INPUT_SCHEMA["properties"]["steps_to_reproduce"]
     # Other half of the call contract.
     assert call["schema_name"] == "bug_report"
     assert call["max_tokens"] == 1500
@@ -203,3 +207,108 @@ def test_empty_image_rejected(tmp_path):
     with pytest.raises(BugTicketError) as ei:
         vision.extract_bug_report(ctx, str(p))
     assert ei.value.error == "empty_image"
+
+
+# --- two-schema convergence: extra/off-type model output is FIXED, not rejected --
+def test_extra_model_field_is_dropped_not_rejected(tmp_path):
+    # Models routinely add helper keys; the relaxed input schema lets the host pass
+    # them through, so _normalize must drop them rather than _validate rejecting the
+    # whole (otherwise valid) report. This is the headline regression guard.
+    rep = dict(_FULL_REPORT, priority="P1", tags=["x"], notes="model added this")
+    ctx = _FakeCtx(_FakeResult(parsed=rep))
+    report = vision.extract_bug_report(ctx, str(_png(tmp_path)))
+    assert report["title"] == _FULL_REPORT["title"]
+    for extra in ("priority", "tags", "notes"):
+        assert extra not in report  # unknown keys projected away
+
+
+def test_non_string_scalars_are_coerced(tmp_path):
+    # A numeric severity / non-string list items must be coerced by _normalize, not
+    # rejected (the relaxed input schema no longer constrains per-field types).
+    rep = dict(_FULL_REPORT, severity=3, steps_to_reproduce=[1, 2])
+    ctx = _FakeCtx(_FakeResult(parsed=rep))
+    report = vision.extract_bug_report(ctx, str(_png(tmp_path)))
+    assert report["severity"] == "major"  # unrecognized -> safe default
+    assert report["steps_to_reproduce"] == ["1", "2"]
+
+
+@pytest.mark.parametrize("title", ["   ", "\t\n ", ""])
+def test_blank_title_rejected(tmp_path, title):
+    rep = dict(_FULL_REPORT, title=title)
+    ctx = _FakeCtx(_FakeResult(parsed=rep))
+    with pytest.raises(BugTicketError) as ei:
+        vision.extract_bug_report(ctx, str(_png(tmp_path)))
+    assert ei.value.error == "vision_invalid"  # stripped-empty required field
+
+
+def test_relaxed_vs_strict_schema_contract():
+    # Behavioral (not static-dict) check of the two-schema invariant: the relaxed
+    # schema accepts off-enum + extra-key output the host would otherwise reject,
+    # the strict schema rejects it, and _normalize bridges the two.
+    import jsonschema
+
+    from hermes_plugins.hermes_bug_vision_ticket.schemas import (
+        BUG_REPORT_INPUT_SCHEMA,
+        BUG_REPORT_SCHEMA,
+    )
+
+    off = {"title": "t", "summary": "s", "severity": "high", "actual_behavior": "a", "priority": "P1"}
+    jsonschema.validate(off, BUG_REPORT_INPUT_SCHEMA)  # host pre-validation must pass
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(off, BUG_REPORT_SCHEMA)  # strict rejects off-enum + extra key
+    norm = vision._normalize(off)
+    assert "priority" not in norm and norm["severity"] == "critical"
+    jsonschema.validate(norm, BUG_REPORT_SCHEMA)  # normalized output is now strictly valid
+
+
+# --- previously-uncovered resolve_image / read failure codes --------------------
+@pytest.mark.parametrize("bad", [None, "", 123])
+def test_invalid_image_path(bad):
+    with pytest.raises(BugTicketError) as ei:
+        vision.resolve_image(bad)
+    assert ei.value.error == "invalid_image_path"
+
+
+def test_image_not_a_file(tmp_path):
+    d = tmp_path / "a-dir.png"  # right extension, but a directory
+    d.mkdir()
+    with pytest.raises(BugTicketError) as ei:
+        vision.resolve_image(str(d))
+    assert ei.value.error == "image_not_a_file"
+
+
+def test_image_too_large_stat(tmp_path, monkeypatch):
+    monkeypatch.setattr(vision, "_MAX_IMAGE_BYTES", 4)
+    big = tmp_path / "big.png"
+    big.write_bytes(b"123456789")  # 9 > 4
+    with pytest.raises(BugTicketError) as ei:
+        vision.resolve_image(str(big))
+    assert ei.value.error == "image_too_large"
+
+
+def test_image_too_large_post_read_toctou(tmp_path, monkeypatch):
+    # Pass a pre-resolved path to skip resolve_image's stat-check and exercise the
+    # bounded-read overflow guard (the defense against a file swapped after stat).
+    monkeypatch.setattr(vision, "_MAX_IMAGE_BYTES", 4)
+    big = tmp_path / "big.png"
+    big.write_bytes(b"123456789")
+    ctx = _FakeCtx(_FakeResult(parsed=dict(_FULL_REPORT)))
+    with pytest.raises(BugTicketError) as ei:
+        vision.extract_bug_report(ctx, str(big), resolved=(big, "image/png"))
+    assert ei.value.error == "image_too_large"
+
+
+def test_image_unreadable(tmp_path, monkeypatch):
+    img = _png(tmp_path)
+    real_open = open
+
+    def fake_open(file, mode="r", *a, **k):
+        if "bug.png" in str(file):
+            raise OSError("simulated unreadable")
+        return real_open(file, mode, *a, **k)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    ctx = _FakeCtx(_FakeResult(parsed=dict(_FULL_REPORT)))
+    with pytest.raises(BugTicketError) as ei:
+        vision.extract_bug_report(ctx, str(img))
+    assert ei.value.error == "image_unreadable"

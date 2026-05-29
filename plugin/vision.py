@@ -23,9 +23,10 @@ quoted/escaped before reaching any tracker API).
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any
 
 from .errors import BugTicketError
 from .schemas import (
@@ -94,7 +95,7 @@ _LIST_FIELDS = ("steps_to_reproduce", "ui_elements_observed", "visible_text")
 _STR_FIELDS = ("title", "summary", "expected_behavior", "actual_behavior")
 
 
-def resolve_image(image_path: str) -> Tuple[Path, str]:
+def resolve_image(image_path: str) -> tuple[Path, str]:
     """Realpath + validate the screenshot path; return (path, mime_type).
 
     Resolves symlinks first (defense against path tricks), then checks the file
@@ -140,15 +141,13 @@ def resolve_image(image_path: str) -> Tuple[Path, str]:
     return real, mime
 
 
-def _parsed_from_result(result: Any) -> Dict[str, Any]:
+def _parsed_from_result(result: Any) -> dict[str, Any]:
     """Pull the parsed JSON object out of a PluginLlmStructuredResult-like value."""
     parsed = getattr(result, "parsed", None)
     if parsed is None:
         # Fall back to parsing .text if the host didn't pre-parse.
         text = getattr(result, "text", None)
         if isinstance(text, str) and text.strip():
-            import json
-
             try:
                 parsed = json.loads(text)
             except ValueError:
@@ -162,15 +161,22 @@ def _parsed_from_result(result: Any) -> Dict[str, Any]:
     return parsed
 
 
-def _normalize(report: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize(report: dict[str, Any]) -> dict[str, Any]:
     """Coerce a raw model report into a complete, well-typed BugReport.
 
     Severity/confidence are clamped into their enums; list/str fields are
-    defaulted to the right type. Done BEFORE schema validation so a slightly
-    off-enum severity is fixed rather than rejected (but missing required text
-    like 'title' still fails validation).
+    defaulted to the right type and stripped. Done BEFORE schema validation so
+    fixable model output is repaired rather than rejected (but a missing/blank
+    required field like 'title' still fails validation).
+
+    Crucially, the report is first PROJECTED down to the known BUG_REPORT_SCHEMA
+    fields: the relaxed input schema lets the host pass through extra model-emitted
+    keys (e.g. "notes"/"tags"/"priority"), but the strict schema sets
+    additionalProperties:false — dropping unknown keys here is what makes the two
+    schemas converge, instead of _validate rejecting an otherwise-good report.
     """
-    out: Dict[str, Any] = dict(report)
+    known = BUG_REPORT_SCHEMA["properties"]
+    out: dict[str, Any] = {k: v for k, v in report.items() if k in known}
 
     sev_raw = str(out.get("severity", "") or "").strip().lower()
     out["severity"] = _SEVERITY_SYNONYMS.get(sev_raw, _DEFAULT_SEVERITY)
@@ -185,20 +191,23 @@ def _normalize(report: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(val, list):
             out[field] = []
         else:
-            out[field] = [str(x) for x in val]
+            out[field] = [s for s in (str(x).strip() for x in val) if s]
 
+    # Coerce-to-str AND strip text fields: a whitespace-only required field (e.g.
+    # title) then collapses to "" and fails the strict schema's minLength check,
+    # rather than silently filing a blank-titled ticket.
     for field in _STR_FIELDS:
-        if field in out and out[field] is not None and not isinstance(out[field], str):
-            out[field] = str(out[field])
+        if field in out and out[field] is not None:
+            out[field] = str(out[field]).strip()
 
     # component_hint: keep a non-empty string or null.
     ch = out.get("component_hint")
-    out["component_hint"] = ch if isinstance(ch, str) and ch.strip() else None
+    out["component_hint"] = ch.strip() if isinstance(ch, str) and ch.strip() else None
 
     return out
 
 
-def _validate(report: Dict[str, Any]) -> None:
+def _validate(report: dict[str, Any]) -> None:
     """Validate the normalized report against BUG_REPORT_SCHEMA.
 
     jsonschema is a core hermes-agent dependency; if it is somehow unavailable
@@ -228,13 +237,24 @@ def _validate(report: Dict[str, Any]) -> None:
         ) from exc
 
 
-def extract_bug_report(ctx, image_path: str, *, purpose: str = "bug-vision-extract") -> Dict[str, Any]:
+def extract_bug_report(
+    ctx,
+    image_path: str,
+    *,
+    resolved: tuple[Path, str] | None = None,
+    purpose: str = "bug-vision-extract",
+) -> dict[str, Any]:
     """Turn a screenshot into a validated, normalized BugReport dict.
+
+    ``resolved`` may carry the ``(path, mime)`` from an earlier
+    ``resolve_image`` call so the caller's up-front validation is not repeated;
+    when omitted the path is resolved here. The bounded read below re-checks size
+    regardless, so passing a pre-resolved path keeps the TOCTOU defense.
 
     Raises ``BugTicketError`` on any failure (bad path, model returned junk,
     schema mismatch). On success returns a dict conforming to BUG_REPORT_SCHEMA.
     """
-    path, mime = resolve_image(image_path)
+    path, mime = resolved if resolved is not None else resolve_image(image_path)
 
     # Bounded read of the validated path: read at most the cap (+1 to detect
     # overflow) from a single handle so a file swapped after resolve_image's stat

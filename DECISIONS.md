@@ -127,6 +127,41 @@ applied:
   `schema_name`/`max_tokens`/`purpose` half of the vision call contract. Suite
   76 -> 87, all green.
 
+## Post-delivery exhaustive review hardening
+
+A second, broader multi-lens review (8 lenses × adversarial verification against the
+pinned host source) surfaced 26 distinct findings; all were fixed. Suite 87 → 135,
+all green; only enforced lint (`PLW1514`) still clean.
+
+- **HIGH — two-schema non-convergence (vision).** The relaxed input schema allows
+  extra keys (`additionalProperties:true`) but the strict schema forbids them, and
+  `_normalize` did `dict(report)` without dropping them — so any extra model key
+  (`priority`/`tags`/…) made a valid extraction fail as `vision_invalid`. Fix:
+  `_normalize` now **projects to the known fields** before validation, fully loosens
+  the input schema (no per-field `type` either, so numeric/off-type scalars are
+  coerced not rejected), strips text fields, and the strict schema gained
+  `minLength:1` on title/summary/actual_behavior (blank-title tickets). Behavioral
+  relaxed-accepts/strict-rejects test added.
+- **MEDIUM — clients robustness.** `_http` now catches the `RequestException` base
+  (chunked-encoding/decoding/redirects no longer escape to `internal_error`), maps
+  TLS failures to a distinct non-retried `tls_error`, and treats rate limits (429, or
+  403 with a Retry-After / `X-RateLimit-Remaining:0` / rate-limit body) as a retried
+  `rate_limited` honoring a capped `Retry-After` — a plain 403 stays
+  `invalid_credentials`.
+- **MEDIUM — GitHub dedup injection.** The GitHub dedup query now sanitizes untrusted
+  free-text (strips `:`/quotes so injected search qualifiers degrade to terms) and
+  `find_duplicate` verifies the matched issue's **title equals** the expected title
+  (mirrors Linear), so a crafted screenshot title can't force a false dedup / spoofed
+  URL / suppressed filing.
+- **LOW/INFO.** Jira project-key + GitHub `owner/name` validation (JQL / URL-path
+  safety); reserved-field guard so `severity_map`/`custom_fields` can't silently
+  clobber core fields; Linear dropped the `labels→labelIds` fallback and now inspects
+  GraphQL `extensions` for auth errors; `JIRA_EMAIL` added to the secret denylist;
+  echoed tracker bodies control-char-scrubbed; observed `ui_elements`/`visible_text`/
+  `component_hint` now rendered into the ticket body (were extracted then dropped);
+  config raw-parse cached by mtime (the hook+handler double-load); `resolve_image`
+  no longer runs twice; builtin-generic typing throughout; hoisted lazy imports.
+
 ## Other autonomous choices
 
 - Cloned `hermes-agent` shallow (`--depth 1`); built `.venv` with `pip install -e

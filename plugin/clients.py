@@ -7,12 +7,15 @@ Each client exposes:
 
 Hard rules enforced here:
   * Every request is HTTPS with an explicit timeout. No exceptions.
-  * Bounded retries (2) on connection errors / timeouts / 5xx only — never on 4xx.
+  * Bounded retries (2) on connection errors / timeouts / 5xx / rate limits only —
+    never on a 4xx that is not a rate limit. Any other transport error is mapped to
+    a structured error too (never escapes as a generic internal_error).
   * Credentials are read from env ONLY when a client is constructed/used, never
     logged, and never echoed in errors.
   * Status codes map to structured errors: 401/403 -> invalid credentials (the
-    remediation names the env var), 404 -> project/repo not found, timeout ->
-    tracker unreachable.
+    remediation names the env var), 404 -> project/repo not found, 403/429 with a
+    rate-limit signal -> rate_limited (Retry-After honored), TLS failure ->
+    tls_error, timeout -> tracker_timeout, other transport failure -> unreachable.
 
 ``requests`` is a core hermes-agent dependency, so no new dependency is added.
 Tests monkeypatch ``clients.requests.request`` — no real network.
@@ -20,8 +23,11 @@ Tests monkeypatch ``clients.requests.request`` — no real network.
 
 from __future__ import annotations
 
+import os
+import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -30,12 +36,14 @@ from .errors import BugTicketError
 DEFAULT_TIMEOUT = 15.0
 _MAX_RETRIES = 2          # total attempts = _MAX_RETRIES + 1
 _BACKOFF_SECONDS = 0.3
+_MAX_RETRY_AFTER = 20.0   # cap an honored Retry-After so a tool call can't block long
 _RETRYABLE_STATUS = {500, 502, 503, 504}
+# Control chars (incl. C1) are scrubbed from any tracker body we echo back: the body
+# is untrusted/attacker-influenceable and ends up in a remediation string.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _require_env(name: str) -> str:
-    import os
-
     val = os.environ.get(name)
     if not val:
         raise BugTicketError(
@@ -45,14 +53,57 @@ def _require_env(name: str) -> str:
     return val
 
 
+def _resp_headers(resp: requests.Response) -> dict[str, Any]:
+    """Headers as a mapping, tolerant of mocks that omit the attribute."""
+    return getattr(resp, "headers", None) or {}
+
+
+def _backoff(attempt: int) -> float:
+    return _BACKOFF_SECONDS * (attempt + 1)
+
+
+def _retry_after(resp: requests.Response, attempt: int) -> float:
+    """Honor a numeric Retry-After (capped); fall back to linear backoff."""
+    raw = _resp_headers(resp).get("Retry-After")
+    if raw:
+        try:
+            secs = float(str(raw).strip())
+        except ValueError:
+            secs = -1.0  # HTTP-date form — not parsed; use backoff
+        if secs >= 0:
+            return min(secs, _MAX_RETRY_AFTER)
+    return _backoff(attempt)
+
+
+def _is_rate_limited(resp: requests.Response) -> bool:
+    """True for a rate-limit response. 429 always; 403 only with a rate-limit signal.
+
+    GitHub signals primary/secondary rate limits with 403 OR 429 (+ Retry-After /
+    X-RateLimit-Remaining: 0 / a rate-limit body); a plain 403 stays an auth error.
+    """
+    status = resp.status_code
+    if status == 429:
+        return True
+    if status == 403:
+        headers = _resp_headers(resp)
+        if headers.get("Retry-After"):
+            return True
+        if str(headers.get("X-RateLimit-Remaining", "")).strip() == "0":
+            return True
+        body = _short_body(resp).lower()
+        if "rate limit" in body or "secondary rate" in body or "abuse" in body:
+            return True
+    return False
+
+
 def _http(
     method: str,
     url: str,
     *,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Any] = None,
-    auth: Optional[Tuple[str, str]] = None,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json_body: Any | None = None,
+    auth: tuple[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     creds_hint: str = "",
     notfound_hint: str = "",
@@ -64,7 +115,7 @@ def _http(
             f"Refusing a non-HTTPS request to {url!r}; tracker URLs must use https://.",
         )
 
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
             resp = requests.request(
@@ -78,13 +129,34 @@ def _http(
             )
         except requests.exceptions.Timeout as exc:
             last_exc = exc
+        except requests.exceptions.SSLError as exc:
+            # TLS/certificate failure: non-transient and retrying cannot fix it.
+            # Map distinctly so the remediation points at the cert/base_url, not
+            # connectivity (and so it is not retried).
+            raise BugTicketError(
+                "tls_error",
+                "TLS/certificate verification failed for the tracker host; check its "
+                "certificate or base_url.",
+            ) from exc
         except requests.exceptions.ConnectionError as exc:
+            last_exc = exc
+        except requests.exceptions.RequestException as exc:
+            # Any other transport-layer failure (chunked-encoding, content-decoding,
+            # too-many-redirects, …). Catch the base class so no network error escapes
+            # to the handler's generic internal_error fallback.
             last_exc = exc
         else:
             status = resp.status_code
-            if status in _RETRYABLE_STATUS and attempt < _MAX_RETRIES:
-                time.sleep(_BACKOFF_SECONDS * (attempt + 1))
+            rate_limited = _is_rate_limited(resp)
+            if (rate_limited or status in _RETRYABLE_STATUS) and attempt < _MAX_RETRIES:
+                time.sleep(_retry_after(resp, attempt) if rate_limited else _backoff(attempt))
                 continue
+            if rate_limited:
+                raise BugTicketError(
+                    "rate_limited",
+                    "The tracker is rate-limiting requests; wait and retry, and reduce "
+                    "the request rate.",
+                )
             if status in (401, 403):
                 raise BugTicketError(
                     "invalid_credentials",
@@ -103,12 +175,15 @@ def _http(
             return resp
 
         if attempt < _MAX_RETRIES:
-            time.sleep(_BACKOFF_SECONDS * (attempt + 1))
+            time.sleep(_backoff(attempt))
 
     # Exhausted retries on a transport error.
     if isinstance(last_exc, requests.exceptions.Timeout):
         raise BugTicketError("tracker_timeout", "The tracker did not respond in time; try again later.")
-    raise BugTicketError("tracker_unreachable", "Could not reach the tracker; check connectivity.")
+    if isinstance(last_exc, requests.exceptions.ConnectionError):
+        raise BugTicketError("tracker_unreachable", "Could not reach the tracker; check connectivity.")
+    kind = type(last_exc).__name__ if last_exc else "unknown error"
+    raise BugTicketError("tracker_unreachable", f"The tracker request failed ({kind}); check connectivity.")
 
 
 def _short_body(resp: requests.Response, limit: int = 200) -> str:
@@ -116,11 +191,14 @@ def _short_body(resp: requests.Response, limit: int = 200) -> str:
         text = resp.text or ""
     except Exception:
         return ""
-    text = text.strip().replace("\n", " ")
+    # Scrub control characters and collapse whitespace: the body is untrusted and
+    # is echoed into a remediation, so it must be inert opaque data.
+    text = _CONTROL_CHARS.sub(" ", text)
+    text = " ".join(text.split())
     return text[:limit]
 
 
-def _json_body(resp: requests.Response) -> Dict[str, Any]:
+def _json_body(resp: requests.Response) -> dict[str, Any]:
     """Parse a JSON object body, mapping a non-JSON 2xx response to a clean error.
 
     ``resp.json()`` raises ``requests...JSONDecodeError`` (a ``ValueError``) on a
@@ -144,7 +222,7 @@ def _json_body(resp: requests.Response) -> Dict[str, Any]:
 class JiraClient:
     """Jira Cloud REST v3 (basic auth: email + API token)."""
 
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: dict[str, Any]) -> None:
         base = (cfg.get("base_url") or "").strip().rstrip("/")
         if not base:
             base = _require_env("JIRA_BASE_URL").rstrip("/")
@@ -158,12 +236,12 @@ class JiraClient:
             )
 
     @property
-    def _auth(self) -> Tuple[str, str]:
+    def _auth(self) -> tuple[str, str]:
         return (self.email, self.token)
 
     _CREDS = "Check JIRA_EMAIL and JIRA_API_TOKEN."
 
-    def find_duplicate(self, dedup: Dict[str, Any]) -> Optional[str]:
+    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
         if dedup.get("kind") != "jql":
             return None
         resp = _http(
@@ -180,7 +258,7 @@ class JiraClient:
             return None
         return f"{self.base_url}/browse/{issues[0]['key']}"
 
-    def create_issue(self, project: str, payload: Dict[str, Any]) -> Dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
         resp = _http(
             "POST",
             f"{self.base_url}/rest/api/3/issue",
@@ -212,15 +290,15 @@ _LINEAR_SEARCH = (
 class LinearClient:
     """Linear GraphQL API (personal API key in the Authorization header)."""
 
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: dict[str, Any]) -> None:
         self.api_key = _require_env("LINEAR_API_KEY")
 
     _CREDS = "Check LINEAR_API_KEY."
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         return {"Authorization": self.api_key, "Content-Type": "application/json"}
 
-    def _graphql(self, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         resp = _http(
             "POST",
             _LINEAR_URL,
@@ -229,15 +307,27 @@ class LinearClient:
             creds_hint=self._CREDS,
         )
         body = _json_body(resp)
-        if body.get("errors"):
-            msg = "; ".join(str(e.get("message", e)) for e in body["errors"])[:200]
-            # Linear reports auth failures as GraphQL errors with HTTP 200.
-            if "authentication" in msg.lower() or "unauthorized" in msg.lower():
+        errors = body.get("errors")
+        if errors:
+            msg = "; ".join(str(e.get("message", e)) for e in errors)[:200]
+            # Linear reports auth failures as GraphQL errors with HTTP 200. Detect
+            # via the structured error extensions (type/code) when present — the
+            # message text is not contractual — falling back to message keywords.
+            blob = msg.lower()
+            for e in errors:
+                ext = e.get("extensions") if isinstance(e, dict) else None
+                if isinstance(ext, dict):
+                    blob += " " + str(ext.get("type", "")).lower() + " " + str(ext.get("code", "")).lower()
+            if any(
+                k in blob
+                for k in ("authentication", "unauthorized", "not authorized",
+                          "forbidden", "invalid api key", "api key")
+            ):
                 raise BugTicketError("invalid_credentials", self._CREDS)
             raise BugTicketError("tracker_error", f"Linear API error: {msg}")
         return body.get("data") or {}
 
-    def find_duplicate(self, dedup: Dict[str, Any]) -> Optional[str]:
+    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
         if dedup.get("kind") != "linear":
             return None
         title = (dedup.get("title") or "").strip()
@@ -250,7 +340,7 @@ class LinearClient:
                 return node.get("url")
         return None
 
-    def create_issue(self, project: str, payload: Dict[str, Any]) -> Dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
         data = self._graphql(_LINEAR_CREATE, {"input": payload})
         result = data.get("issueCreate") or {}
         if not result.get("success"):
@@ -268,37 +358,45 @@ _GITHUB_API = "https://api.github.com"
 class GitHubClient:
     """GitHub Issues REST API (token bearer auth)."""
 
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: dict[str, Any]) -> None:
         self.token = _require_env("GITHUB_TOKEN")
 
     _CREDS = "Check GITHUB_TOKEN (needs 'repo'/'issues' scope)."
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def find_duplicate(self, dedup: Dict[str, Any]) -> Optional[str]:
+    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
         if dedup.get("kind") != "github_search":
             return None
         resp = _http(
             "GET",
             f"{_GITHUB_API}/search/issues",
             headers=self._headers(),
-            params={"q": dedup["q"], "per_page": 1},
+            params={"q": dedup["q"], "per_page": 10},
             creds_hint=self._CREDS,
         )
         items = _json_body(resp).get("items") or []
-        if not items:
-            return None
-        return items[0].get("html_url")
+        # Verify the matched issue's title actually equals the expected title before
+        # treating it as a duplicate (mirrors Linear). GitHub search is fuzzy and the
+        # query is built from untrusted model text, so a bare top-hit could be an
+        # unrelated issue; an exact-title check prevents a false dedup / wrong URL.
+        expected = (dedup.get("title") or "").strip().lower()
+        for item in items:
+            if not expected or (item.get("title") or "").strip().lower() == expected:
+                return item.get("html_url")
+        return None
 
-    def create_issue(self, project: str, payload: Dict[str, Any]) -> Dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
         resp = _http(
             "POST",
-            f"{_GITHUB_API}/repos/{project}/issues",
+            # project is validated to owner/name in mapping._resolve_project; quote
+            # each path segment as defense-in-depth so it can never alter the path.
+            f"{_GITHUB_API}/repos/{quote(project, safe='/')}/issues",
             headers=self._headers(),
             json_body=payload,
             creds_hint=self._CREDS,
@@ -315,7 +413,7 @@ _CLIENTS = {
 }
 
 
-def make_client(target: str, target_cfg: Dict[str, Any]):
+def make_client(target: str, target_cfg: dict[str, Any]):
     """Construct the client for ``target`` (reads + validates its env credentials)."""
     cls = _CLIENTS.get(target)
     if cls is None:

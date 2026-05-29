@@ -200,8 +200,92 @@ def test_missing_project():
     assert ei.value.error == "missing_project"
 
 
+def test_invalid_severity_map_scalar_entry():
+    cfg = dict(JIRA_CFG, severity_map={"critical": "High"})  # scalar, not a mapping
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "jira", cfg)
+    assert ei.value.error == "invalid_severity_map"
+
+
+def test_missing_title():
+    bug = {k: v for k, v in BUG.items() if k != "title"}
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(bug, "jira", JIRA_CFG)
+    assert ei.value.error == "missing_title"
+
+
 def test_dedup_disabled_returns_none():
     cfg = dict(JIRA_CFG, dedup={"enabled": False})
     assert mapping.build_dedup(BUG, "jira", cfg, "ENG") is None
     cfg2 = {k: v for k, v in JIRA_CFG.items() if k != "dedup"}
     assert mapping.build_dedup(BUG, "jira", cfg2, "ENG") is None
+
+
+# --- project/repo validation ------------------------------------------------
+@pytest.mark.parametrize("bad", ["ENG ORDER BY created", "ENG OR x", 'a"b', "1ENG", "ENG-2"])
+def test_jira_invalid_project_key(bad):
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "jira", JIRA_CFG, project=bad)
+    assert ei.value.error == "invalid_project_key"
+
+
+@pytest.mark.parametrize("bad", ["owner/", "/name", "a/b/c", "acme/web?x=1", "..", "owner/ b"])
+def test_github_repo_malformed_rejected(bad):
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "github_issues", dict(GITHUB_CFG, repo=bad))
+    assert ei.value.error == "invalid_repo"
+
+
+def test_github_repo_valid_dotted_name_accepted():
+    out = mapping.to_payload(BUG, "github_issues", dict(GITHUB_CFG, repo="acme/web.js"))
+    assert out["project"] == "acme/web.js"
+
+
+# --- reserved-field guard (severity_map / custom_fields cannot clobber core) -
+def test_jira_severity_map_reserved_key_rejected():
+    cfg = dict(JIRA_CFG, severity_map={"critical": {"summary": "PWNED", "priority": {"name": "High"}}})
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "jira", cfg)
+    assert ei.value.error == "reserved_field_override"
+
+
+def test_jira_custom_fields_reserved_key_rejected():
+    cfg = dict(JIRA_CFG, custom_fields={"description": "clobbered"})
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "jira", cfg)
+    assert ei.value.error == "reserved_field_override"
+
+
+def test_linear_severity_map_reserved_key_rejected():
+    cfg = dict(LINEAR_CFG, severity_map={"critical": {"title": "PWNED", "priority": 1}})
+    with pytest.raises(BugTicketError) as ei:
+        mapping.to_payload(BUG, "linear", cfg)
+    assert ei.value.error == "reserved_field_override"
+
+
+# --- GitHub dedup qualifier-injection sanitization --------------------------
+def test_github_dedup_sanitizes_qualifier_injection():
+    bug = dict(BUG, title="Save fails repo:victim/secret is:open")
+    d = mapping.build_dedup(bug, "github_issues", GITHUB_CFG, "acme/web")
+    # The structural repo: qualifier (from the template) stays; the injected ':'
+    # tokens from the untrusted title are neutralized, so no second repo:/is: lands.
+    assert d["q"].startswith("repo:acme/web is:issue is:open in:title ")
+    injected = d["q"].split("in:title ", 1)[1]
+    assert ":" not in injected  # qualifier delimiter stripped from untrusted text
+    assert d["title"] == bug["title"]  # original title kept for client-side verification
+
+
+# --- Linear label_ids: no fallback to display-name `labels` -----------------
+def test_linear_labels_key_is_not_used_as_label_ids():
+    cfg = {k: v for k, v in LINEAR_CFG.items() if k != "label_ids"}
+    cfg["labels"] = ["bug", "ui"]  # display names — must NOT become labelIds
+    payload = mapping.to_payload(BUG, "linear", cfg)["create_payload"]
+    assert "labelIds" not in payload
+
+
+# --- extracted observed fields are rendered into the body -------------------
+def test_observed_fields_rendered_into_body():
+    body = mapping.to_payload(BUG, "github_issues", GITHUB_CFG)["create_payload"]["body"]
+    assert "Affected component: settings-page" in body
+    assert "## Observed UI elements" in body and "Save button" in body
+    assert "Text observed in screenshot" in body and "Save" in body

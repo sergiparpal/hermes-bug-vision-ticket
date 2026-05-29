@@ -98,13 +98,24 @@ targets:
 ```
 
 - **`severity_map`** is required per target — an unmapped severity is a structured
-  error (the plugin never guesses a priority/label).
+  error (the plugin never guesses a priority/label). A `severity_map` (or Jira
+  `custom_fields`) entry may **not** set a core field the builder owns (Jira
+  `project`/`issuetype`/`summary`/`description`; Linear `teamId`/`title`/`description`)
+  — a colliding key is a structured `reserved_field_override` error, not a silent
+  overwrite.
 - **`{placeholder}`** templates (in `custom_fields`, `jql_template`,
   `search_template`) expand from the bug report: `title`, `summary`, `severity`,
   `confidence`, `component_hint`, `expected_behavior`, `actual_behavior`, plus
   `project` / `project_key` / `team_id` / `repo`. An unknown placeholder is an error.
-- **`dedup`** is checked before creating; if a match is found the existing ticket
-  URL is returned and nothing new is created (idempotent re-runs).
+  In GitHub `search_template`, untrusted free-text is sanitized so it cannot inject
+  search qualifiers.
+- **`dedup`** is checked before creating; if a match is found (for GitHub/Linear,
+  only when the existing issue's **title matches**) the existing ticket URL is
+  returned and nothing new is created (idempotent re-runs).
+- **Project identifiers are validated:** a Jira `project_key` must be
+  `^[A-Za-z][A-Za-z0-9_]*$` and a GitHub `repo` must be a well-formed `owner/name`.
+- The filed ticket body includes the model's **observed UI elements** and the
+  **text read from the screenshot** (clearly labelled as untrusted, as-read data).
 
 ### Required environment variables (per tracker)
 

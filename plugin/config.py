@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import yaml
 
@@ -30,7 +30,17 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 # for non-secret structure (e.g. base URLs), and a stray ${GITHUB_TOKEN} in, say,
 # a custom_fields value would otherwise be copied verbatim into a ticket payload.
 # Such references expand to "" instead, so a secret can't leak into tracker content.
-_SECRET_ENV_DENYLIST = frozenset({"JIRA_API_TOKEN", "LINEAR_API_KEY", "GITHUB_TOKEN"})
+# JIRA_EMAIL is the basic-auth username (clients.py auth=(email, token)) — credential
+# material — so it is denied too; JIRA_BASE_URL is non-secret and stays expandable.
+_SECRET_ENV_DENYLIST = frozenset(
+    {"JIRA_API_TOKEN", "LINEAR_API_KEY", "GITHUB_TOKEN", "JIRA_EMAIL"}
+)
+
+# Cache the RAW parsed YAML keyed on (mtime_ns, size): the approval hook and the
+# handler each load the config once per invocation, so this avoids a redundant
+# read+parse. Env expansion + validation are deliberately NOT cached — they re-run
+# every call so a changed environment is always reflected.
+_RAW_PARSE_CACHE: dict[str, tuple[int, int, Any]] = {}
 
 
 def hermes_home() -> Path:
@@ -88,7 +98,21 @@ def example_config_text() -> str:
     )
 
 
-def load_config() -> Dict[str, Any]:
+def _read_and_parse(path: Path) -> Any:
+    """Read + YAML-parse the config, cached by (mtime_ns, size) to skip the redundant
+    second read/parse per tool call. Returns the raw parsed object (never mutated)."""
+    st = path.stat()
+    key = str(path)
+    cached = _RAW_PARSE_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    _RAW_PARSE_CACHE[key] = (st.st_mtime_ns, st.st_size, data)
+    return data
+
+
+def load_config() -> dict[str, Any]:
     """Read, env-expand, and structurally validate the config. Raises BugTicketError."""
     path = config_path()
     if not path.exists():
@@ -98,12 +122,9 @@ def load_config() -> Dict[str, Any]:
         )
 
     try:
-        raw = path.read_text(encoding="utf-8")
+        data = _read_and_parse(path)
     except OSError as exc:
         raise BugTicketError("config_unreadable", f"Could not read {path}: {exc}") from exc
-
-    try:
-        data = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         raise BugTicketError("config_invalid_yaml", f"{path} is not valid YAML: {exc}") from exc
 
@@ -137,7 +158,7 @@ def load_config() -> Dict[str, Any]:
     return data
 
 
-def resolve_target_name(cfg: Dict[str, Any], requested: str | None) -> str:
+def resolve_target_name(cfg: dict[str, Any], requested: str | None) -> str:
     """Pick the target: explicit arg > default_target > the sole configured target."""
     targets = cfg["targets"]
     if requested:
@@ -168,7 +189,7 @@ def resolve_target_name(cfg: Dict[str, Any], requested: str | None) -> str:
     )
 
 
-def require_approval(cfg: Dict[str, Any]) -> bool:
+def require_approval(cfg: dict[str, Any]) -> bool:
     """Whether ticket creation must be confirmed (default True)."""
     val = cfg.get("require_approval", True)
     return bool(val)

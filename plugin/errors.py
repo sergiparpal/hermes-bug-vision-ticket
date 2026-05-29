@@ -10,7 +10,7 @@ shaping lives in exactly one place and every module stays focused.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 
 class BugTicketError(Exception):
@@ -22,7 +22,7 @@ class BugTicketError(Exception):
         self.remediation = remediation
         self.extra = extra
 
-    def to_payload(self) -> Dict[str, Any]:
+    def to_payload(self) -> dict[str, Any]:
         return {
             "success": False,
             "error": self.error,

@@ -147,3 +147,29 @@ def test_unknown_target_in_config(home):
     with pytest.raises(BugTicketError) as ei:
         config.load_config()
     assert ei.value.error == "config_unknown_target"
+
+
+def test_jira_email_not_expanded(home, monkeypatch):
+    # JIRA_EMAIL is the basic-auth username (credential material) -> denylisted.
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.com")
+    _write(home, "targets:\n  jira:\n    project_key: ENG\n    custom_fields:\n      reporter: '${JIRA_EMAIL}'\n")
+    cfg = config.load_config()
+    assert cfg["targets"]["jira"]["custom_fields"]["reporter"] == ""  # not the email
+
+
+def test_config_unreadable(home):
+    # A path that exists but cannot be read as text (it is a directory) -> structured.
+    (home / "bug-tickets.yaml").mkdir()
+    with pytest.raises(BugTicketError) as ei:
+        config.load_config()
+    assert ei.value.error == "config_unreadable"
+
+
+def test_config_cache_reflects_file_changes(home, monkeypatch):
+    # The raw-parse cache is keyed on (mtime_ns, size); rewriting the file must be
+    # picked up, never serving stale parsed content.
+    monkeypatch.setenv("JIRA_BASE_URL", "https://acme.atlassian.net")
+    _write(home, GOOD)
+    assert config.load_config()["default_target"] == "jira"
+    _write(home, "default_target: github_issues\ntargets:\n  github_issues:\n    repo: a/b\n")
+    assert config.load_config()["default_target"] == "github_issues"

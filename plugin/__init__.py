@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,12 @@ def _error(error: str, remediation: str, **extra: Any) -> str:
     return _json({"success": False, "error": error, "remediation": remediation, **extra})
 
 
-def _short(text: Optional[str]) -> str:
+def _short(text: str | None) -> str:
     text = (text or "").strip()
     return text if len(text) <= _SUMMARY_MAX else text[: _SUMMARY_MAX - 1] + "…"
 
 
-def _run_pipeline(ctx, args: Dict[str, Any]) -> str:
+def _run_pipeline(ctx, args: dict[str, Any]) -> str:
     """Run the full report-a-bug pipeline and return a bounded JSON string.
 
     ``ctx`` is the PluginContext (for ``ctx.llm``). Kept module-level (rather
@@ -64,8 +64,9 @@ def _run_pipeline(ctx, args: Dict[str, Any]) -> str:
     confirm = bool(args.get("confirm"))
 
     try:
-        # 1. Cheap, direct input validation first (no LLM, no network).
-        vision.resolve_image(args.get("image_path"))
+        # 1. Cheap, direct input validation first (no LLM, no network). Keep the
+        #    resolved (path, mime) so extract_bug_report need not re-stat the file.
+        resolved = vision.resolve_image(args.get("image_path"))
 
         # 2. Config + target + credentials — all before any side effect.
         cfg = config.load_config()
@@ -74,7 +75,7 @@ def _run_pipeline(ctx, args: Dict[str, Any]) -> str:
         client = clients.make_client(target, target_cfg)  # validates credentials
 
         # 3. Vision extraction (the one LLM call).
-        report = vision.extract_bug_report(ctx, args["image_path"])
+        report = vision.extract_bug_report(ctx, args["image_path"], resolved=resolved)
 
         # 4. Map to a tracker payload (pure).
         mapped = mapping.to_payload(report, target, target_cfg, args.get("project"))
@@ -144,7 +145,7 @@ def _approval_required() -> bool:
         return True  # no/invalid config -> err on the safe side and require approval
 
 
-def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_kwargs: Any) -> Optional[Dict[str, str]]:
+def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_kwargs: Any) -> dict[str, str] | None:
     """Approval gate for ticket creation.
 
     Returns None to allow, or {"action":"block","message":...} to deny. Only
@@ -175,7 +176,7 @@ def register(ctx) -> None:
     """Entry point the Hermes PluginManager calls once at load."""
     from .schemas import TOOL_SCHEMA
 
-    def handler(args: Dict[str, Any], **_kwargs: Any) -> str:
+    def handler(args: dict[str, Any], **_kwargs: Any) -> str:
         return _run_pipeline(ctx, args)
 
     ctx.register_tool(

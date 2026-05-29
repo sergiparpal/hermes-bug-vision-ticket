@@ -83,14 +83,26 @@ def _route(monkeypatch, *, dup=False, created_number=42):
     def fake(method, url, **kw):
         calls.append((method, url))
         if "/search/issues" in url:
-            items = [{"html_url": "https://github.com/acme/web/issues/3"}] if dup else []
+            # Real GitHub search results carry the title; dedup verifies it matches.
+            items = (
+                [{"html_url": "https://github.com/acme/web/issues/3", "title": REPORT["title"]}]
+                if dup else []
+            )
             return FakeResp(200, {"items": items})
         if url.endswith("/issues"):
             return FakeResp(201, {"html_url": f"https://github.com/acme/web/issues/{created_number}", "number": created_number})
-        raise AssertionError(f"unexpected request {method} {url}")
+        # Record (don't raise) unexpected calls: an AssertionError here would be
+        # swallowed by _run_pipeline's broad except and surface as internal_error,
+        # hiding which endpoint was hit. Tests assert `not _unexpected(calls)` instead.
+        calls.append(("UNEXPECTED", url))
+        return FakeResp(404, {"message": f"unexpected {method} {url}"})
 
     monkeypatch.setattr(clients.requests, "request", fake)
     return calls
+
+
+def _unexpected(calls):
+    return [u for m, u in calls if m == "UNEXPECTED"]
 
 
 def _run(env, **args):
@@ -108,6 +120,7 @@ def test_happy_create(env, monkeypatch):
     # dedup search then create POST.
     assert any("/search/issues" in u for _m, u in calls)
     assert any(u.endswith("/issues") and m == "POST" for m, u in calls)
+    assert not _unexpected(calls)  # no endpoint other than search + create was hit
 
 
 def test_dedup_short_circuits_create(env, monkeypatch):
@@ -275,5 +288,23 @@ def test_hook_blocks_when_no_config(tmp_path, monkeypatch):
     home = tmp_path / "empty_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    res = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={})
+    assert res is not None and res["action"] == "block"
+
+
+def test_hook_accepts_full_host_kwargs(env):
+    # The host invokes the hook with task_id/session_id/tool_call_id too; the hook's
+    # **_kwargs must absorb them (a narrowed signature would TypeError -> host
+    # swallows it -> fail OPEN, allowing unconfirmed creation).
+    extra = {"task_id": "t1", "session_id": "s1", "tool_call_id": "c1"}
+    blocked = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={"target": "github_issues"}, **extra)
+    assert blocked is not None and blocked["action"] == "block"
+    allowed = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={"confirm": True}, **extra)
+    assert allowed is None
+
+
+def test_hook_blocks_on_invalid_config(env):
+    # A present-but-invalid config must fail safe (block), like a missing one.
+    (env["home"] / "bug-tickets.yaml").write_text("default_target: jira\n", encoding="utf-8")  # no targets
     res = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={})
     assert res is not None and res["action"] == "block"

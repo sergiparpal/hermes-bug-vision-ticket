@@ -15,10 +15,11 @@ from hermes_plugins.hermes_bug_vision_ticket.errors import BugTicketError
 
 
 class FakeResp:
-    def __init__(self, status=200, payload=None, text=""):
+    def __init__(self, status=200, payload=None, text="", headers=None):
         self.status_code = status
         self._payload = {} if payload is None else payload
         self.text = text
+        self.headers = {} if headers is None else headers
 
     def json(self):
         return self._payload
@@ -157,6 +158,90 @@ def test_github_no_retry_on_4xx(creds, monkeypatch):
     assert len(calls) == 1  # 4xx is not retried
 
 
+def test_github_body_control_chars_scrubbed(creds, monkeypatch):
+    # A tracker error body is echoed into the remediation; control chars must be
+    # scrubbed so it can't smuggle escape/control sequences back to the agent.
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(422, text="bad\r\n\x1b[31mred\x00 input"))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    rem = ei.value.remediation
+    assert "\x1b" not in rem and "\r" not in rem and "\x00" not in rem
+
+
+def test_ssl_error_is_tls_error_not_retried(creds, monkeypatch):
+    calls = patch_request(
+        monkeypatch,
+        lambda m, u, c, **k: (_ for _ in ()).throw(requests.exceptions.SSLError("cert verify failed")),
+    )
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "tls_error"
+    assert len(calls) == 1  # non-transient: not retried
+
+
+def test_other_transport_error_is_structured_not_internal(creds, monkeypatch):
+    # ChunkedEncodingError is neither Timeout nor ConnectionError; it must still map
+    # to a structured error (never escape to the handler's internal_error fallback).
+    calls = patch_request(
+        monkeypatch,
+        lambda m, u, c, **k: (_ for _ in ()).throw(requests.exceptions.ChunkedEncodingError("truncated")),
+    )
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "tracker_unreachable"
+    assert len(calls) == clients._MAX_RETRIES + 1
+
+
+def test_github_429_is_rate_limited(creds, monkeypatch):
+    calls = patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(429, {"message": "slow down"}))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "rate_limited"
+    assert len(calls) == clients._MAX_RETRIES + 1  # rate limits are retried, bounded
+
+
+def test_github_403_rate_limit_not_invalid_credentials(creds, monkeypatch):
+    # GitHub uses 403 for secondary rate limits (with Retry-After / a rate-limit
+    # body). It must NOT be reported as 'check your token'.
+    patch_request(
+        monkeypatch,
+        lambda m, u, c, **k: FakeResp(403, {"message": "You have exceeded a secondary rate limit"},
+                                      headers={"Retry-After": "1"}),
+    )
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "rate_limited"
+
+
+def test_plain_403_is_still_invalid_credentials(creds, monkeypatch):
+    # A 403 with no rate-limit signal stays an auth error (regression guard).
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(403, {"message": "Bad credentials"}))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "invalid_credentials"
+
+
+def test_github_dedup_verifies_title(creds, monkeypatch):
+    # Search may fuzzily match; only an exact-title hit is a real duplicate.
+    items = {"items": [
+        {"html_url": "https://github.com/acme/web/issues/1", "title": "Unrelated thing"},
+        {"html_url": "https://github.com/acme/web/issues/2", "title": "Save button overlaps footer"},
+    ]}
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, items))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    dedup = {"kind": "github_search", "q": "x", "title": "Save button overlaps footer"}
+    assert client.find_duplicate(dedup) == "https://github.com/acme/web/issues/2"
+    # No title matches -> not a duplicate.
+    dedup2 = {"kind": "github_search", "q": "x", "title": "Totally different"}
+    assert client.find_duplicate(dedup2) is None
+
+
 # --- Jira -------------------------------------------------------------------
 def test_jira_create_success(creds, monkeypatch):
     def handler(method, url, calls, **kw):
@@ -232,6 +317,34 @@ def test_linear_graphql_auth_error(creds, monkeypatch):
     with pytest.raises(BugTicketError) as ei:
         client.create_issue("team-1", {"teamId": "team-1", "title": "t"})
     assert ei.value.error == "invalid_credentials"
+
+
+def test_linear_auth_error_via_extensions(creds, monkeypatch):
+    # Message text alone wouldn't match, but the structured extensions.type does.
+    body = {"errors": [{"message": "Forbidden resource", "extensions": {"type": "authentication_error"}}]}
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, body))
+    client = clients.make_client("linear", {})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("team-1", {"teamId": "team-1", "title": "t"})
+    assert ei.value.error == "invalid_credentials"
+
+
+def test_linear_non_auth_graphql_error_is_tracker_error(creds, monkeypatch):
+    body = {"errors": [{"message": "Field 'foo' is not defined"}]}
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, body))
+    client = clients.make_client("linear", {})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("team-1", {"teamId": "team-1", "title": "t"})
+    assert ei.value.error == "tracker_error"
+
+
+def test_linear_create_success_false_is_tracker_error(creds, monkeypatch):
+    body = {"data": {"issueCreate": {"success": False}}}
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, body))
+    client = clients.make_client("linear", {})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("team-1", {"teamId": "team-1", "title": "t"})
+    assert ei.value.error == "tracker_error"
 
 
 # --- factory / creds --------------------------------------------------------
