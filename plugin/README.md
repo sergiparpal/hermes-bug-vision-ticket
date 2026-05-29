@@ -1,0 +1,188 @@
+# hermes-bug-vision-ticket
+
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) tool plugin that
+turns a **bug screenshot** into a **structured ticket** in **Jira**, **Linear**,
+or **GitHub Issues** — via a single tool, `report_bug_from_screenshot`.
+
+The agent looks at a screenshot of broken/unexpected UI, extracts a normalized
+bug report (title, severity, steps, expected/actual), maps it to the conventions
+of your tracker, checks for an existing duplicate, and (after you confirm) files
+the ticket — returning the ticket URL.
+
+---
+
+## The tool: `report_bug_from_screenshot`
+
+| Param | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `image_path` | string | ✅ | Absolute path to the screenshot (`.png/.jpg/.jpeg/.gif/.webp`). |
+| `target` | enum `jira`\|`linear`\|`github_issues` | — | Which tracker. Defaults to `default_target` in your config. |
+| `project` | string | — | Project key (Jira), team id (Linear), or `owner/repo` (GitHub), overriding the config default. |
+| `confirm` | boolean | — | `true` to actually create the ticket. Omitted/`false` returns a **preview** and creates nothing (the safe default). |
+
+**Returns** (a JSON string — bounded to a URL + short summary, never the whole body):
+
+- **Preview** (`confirm` false): `{"success": true, "preview": true, "title", "severity", "target", "project", "summary", "message"}`
+- **Created** (`confirm` true): `{"success": true, "created": true, "ticket_url", "ticket_id", "title", "summary", "target"}`
+- **Deduped** (an open ticket with this title already exists): `{"success": true, "deduped": true, "ticket_url", "title", "target"}`
+- **Error**: `{"success": false, "error": "<code>", "remediation": "<how to fix>"}`
+
+### How it works
+
+```
+image_path → validate → load config → resolve target + credentials
+           → vision (one LLM call) → map to tracker payload
+           → find_duplicate → preview  OR  create_issue → ticket URL
+```
+
+> **Vision model requirement.** The plugin asks the host LLM
+> (`ctx.llm.complete_structured`) to read the screenshot and does **not** select
+> a model. Hermes routes this to the user's **active model**, which must be
+> **multimodal** for image input to work. (At the pinned Hermes commit there is
+> no automatic fallback to a dedicated `auxiliary.vision` model for plugin LLM
+> calls.)
+
+---
+
+## Configuration — `~/.hermes/bug-tickets.yaml`
+
+Secrets are **never** stored here; tokens come from environment variables.
+String values may reference env vars with `${VAR}` (expanded at load).
+
+```yaml
+default_target: github_issues   # used when the tool is called without target=
+require_approval: true          # gate creation behind confirm=true (see Approval gate)
+
+targets:
+  jira:
+    base_url: ${JIRA_BASE_URL}            # https://your-org.atlassian.net
+    project_key: ENG
+    issue_type: Bug
+    labels: [from-screenshot]             # optional, always-added labels
+    severity_map:                         # normalized severity -> Jira fields (REQUIRED)
+      blocker:  { priority: { name: Highest } }
+      critical: { priority: { name: High } }
+      major:    { priority: { name: Medium } }
+      minor:    { priority: { name: Low } }
+      trivial:  { priority: { name: Lowest } }
+    custom_fields:                         # arbitrary customfield_XXXXX; {placeholders} pull from the bug report
+      customfield_10010: "{component_hint}"
+    dedup:
+      enabled: true
+      jql_template: >
+        project = {project_key} AND summary ~ "{title}" AND statusCategory != Done
+
+  linear:
+    team_id: <team-uuid>                  # Linear team UUID
+    severity_map:
+      blocker:  { priority: 1 }
+      critical: { priority: 1 }
+      major:    { priority: 2 }
+      minor:    { priority: 3 }
+      trivial:  { priority: 4 }
+    label_ids: [<label-uuid>]             # optional Linear label UUIDs
+    dedup: { enabled: true }              # matches an existing open issue by title
+
+  github_issues:
+    repo: your-org/your-repo
+    default_labels: [bug, from-screenshot]
+    severity_map:
+      blocker:  { labels: [severity:blocker] }
+      critical: { labels: [severity:critical] }
+      major:    { labels: [severity:major] }
+      minor:    { labels: [severity:minor] }
+      trivial:  { labels: [severity:trivial] }
+    dedup:
+      enabled: true
+      search_template: 'repo:{repo} is:issue is:open in:title {title}'
+```
+
+- **`severity_map`** is required per target — an unmapped severity is a structured
+  error (the plugin never guesses a priority/label).
+- **`{placeholder}`** templates (in `custom_fields`, `jql_template`,
+  `search_template`) expand from the bug report: `title`, `summary`, `severity`,
+  `confidence`, `component_hint`, `expected_behavior`, `actual_behavior`, plus
+  `project` / `project_key` / `team_id` / `repo`. An unknown placeholder is an error.
+- **`dedup`** is checked before creating; if a match is found the existing ticket
+  URL is returned and nothing new is created (idempotent re-runs).
+
+### Required environment variables (per tracker)
+
+Configure only the tracker(s) you use. Missing credentials are reported as a
+structured `remediation` error at call time (the plugin still loads).
+
+| Tracker | Variables |
+|---------|-----------|
+| Jira | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` |
+| Linear | `LINEAR_API_KEY` |
+| GitHub Issues | `GITHUB_TOKEN` (scope: `repo`/`issues`) |
+
+---
+
+## Approval gate
+
+Creating a ticket is a side effect, so it is gated two ways:
+
+1. **`confirm` flag** — the handler never POSTs unless `confirm=true`. The default
+   call returns a non-destructive **preview** of the proposed ticket.
+2. **`pre_tool_call` hook** — when `require_approval: true` (the default), an
+   unconfirmed call is **blocked** with a message telling the operator to
+   re-invoke with `confirm=true`. Set `require_approval: false` to rely on the
+   `confirm` flag alone.
+
+(`pre_tool_call` returning `{"action":"block", ...}` is the real blocking hook in
+Hermes; the `pre_approval_request` hook is observer-only and cannot deny.)
+
+---
+
+## Install
+
+```bash
+# 1. Make the plugin discoverable (copy or symlink into your Hermes home).
+ln -s "$(pwd)/plugin" ~/.hermes/plugins/hermes-bug-vision-ticket
+
+# 2. Enable it (plugins are opt-in) in ~/.hermes/config.yaml:
+#    plugins:
+#      enabled: [hermes-bug-vision-ticket]
+
+# 3. Create ~/.hermes/bug-tickets.yaml (see Configuration) and export the env
+#    vars for your tracker.
+```
+
+---
+
+## Privilege surface
+
+This plugin runs with the **full privileges of the agent** (Hermes plugins are
+not sandboxed). It can:
+
+- **Read one local file** — the screenshot at `image_path`. The path is resolved
+  with `os.path.realpath` and validated (must exist, be a regular file, have a
+  supported image extension, and be ≤ 15 MiB) before it is read as bytes.
+- **Send the image to the active LLM** — via the host's `ctx.llm`. The screenshot
+  bytes are transmitted to whatever model/provider the user has configured.
+- **Make authenticated HTTPS writes to your issue tracker** — it reads tracker
+  tokens from environment variables (only when a tracker is used) and creates
+  issues. Every request is HTTPS-only with an explicit timeout and bounded retries
+  (never on 4xx). Tokens are never logged or echoed in errors.
+- It does **not** write any files, run any subprocess, or read any other
+  credentials. The config file is read-only (the plugin never creates it).
+
+LLM output is treated as **untrusted**: the extracted report is re-validated
+against a JSON schema before use, and the system prompt instructs the model to
+never obey instructions embedded in the screenshot (prompt-injection defense).
+
+---
+
+## Development
+
+Tests run against the real Hermes plugin contract with the LLM and HTTP fully
+mocked (no provider, no network, no tokens):
+
+```bash
+# from inside the hermes-agent venv:
+scripts/run_tests.sh dev-plugins/hermes-bug-vision-ticket/tests/
+```
+
+See `../DECISIONS.md` for the pinned Hermes commit and the source-verified
+contract this plugin is built against.
