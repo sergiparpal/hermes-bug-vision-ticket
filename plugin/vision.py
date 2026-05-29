@@ -89,7 +89,7 @@ _LIST_FIELDS = ("steps_to_reproduce", "ui_elements_observed", "visible_text")
 _STR_FIELDS = ("title", "summary", "expected_behavior", "actual_behavior")
 
 
-def _resolve_image(image_path: str) -> Tuple[Path, str]:
+def resolve_image(image_path: str) -> Tuple[Path, str]:
     """Realpath + validate the screenshot path; return (path, mime_type).
 
     Resolves symlinks first (defense against path tricks), then checks the file
@@ -229,7 +229,7 @@ def extract_bug_report(ctx, image_path: str, *, purpose: str = "bug-vision-extra
     Raises ``BugTicketError`` on any failure (bad path, model returned junk,
     schema mismatch). On success returns a dict conforming to BUG_REPORT_SCHEMA.
     """
-    path, mime = _resolve_image(image_path)
+    path, mime = resolve_image(image_path)
 
     try:
         data = path.read_bytes()

@@ -52,13 +52,21 @@ def test_tool_schema_is_well_formed(loaded_manager):
     assert params["properties"]["target"]["enum"] == ["jira", "linear", "github_issues"]
 
 
-def test_skeleton_handler_returns_structured_json_string(loaded_manager):
+def test_handler_returns_structured_json_string(loaded_manager):
     from tools.registry import registry
 
     entry = registry.get_entry(TOOL_NAME)
-    # Handlers MUST return a JSON string (hermes-agent hard rule).
-    out = entry.handler({"image_path": "/tmp/whatever.png"})
+    # Handlers MUST return a JSON string (hermes-agent hard rule). A bad image
+    # path fails fast (before any LLM/network) with a structured error.
+    out = entry.handler({"image_path": "/tmp/does-not-exist.png"})
     assert isinstance(out, str)
     payload = json.loads(out)
     assert payload["success"] is False
+    assert payload["error"] == "image_not_found"
     assert "remediation" in payload
+
+
+def test_pre_tool_call_hook_registered(loaded_manager):
+    # The approval gate hook is registered for pre_tool_call.
+    hooks = loaded_manager._hooks.get("pre_tool_call", [])
+    assert hooks, "pre_tool_call approval hook not registered"
