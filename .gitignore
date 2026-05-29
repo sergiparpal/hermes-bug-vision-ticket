@@ -18,3 +18,8 @@ dist/
 
 # Windows/WSL "mark of the web" metadata
 *:Zone.Identifier
+
+# hermes-agent clone — local tooling dependency (host runtime + scripts/run_tests.sh),
+# not part of this plugin's source. Develop the plugin in the repo root and symlink it
+# into hermes-agent/dev-plugins/ for CI-parity testing.
+/hermes-agent/

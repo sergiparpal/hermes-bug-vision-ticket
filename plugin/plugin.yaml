@@ -1,0 +1,36 @@
+name: hermes-bug-vision-ticket
+version: 0.1.0
+description: "Turn a bug screenshot into a structured ticket in Jira/Linear/GitHub Issues."
+author: "sergiparpal"
+kind: standalone
+provides_tools:
+  - report_bug_from_screenshot
+provides_hooks:
+  - pre_tool_call          # approval gate: blocks unconfirmed ticket creation
+# requires_env is INFORMATIONAL ONLY in hermes-agent (it does NOT auto-disable the
+# plugin). Configure only the tracker(s) you use; per-tracker credentials are
+# validated at call time and surfaced as a structured remediation error.
+requires_env:
+  - name: JIRA_BASE_URL
+    description: "Base URL of your Jira instance, e.g. https://your-org.atlassian.net"
+    prompt: "Jira base URL"
+    secret: false
+  - name: JIRA_EMAIL
+    description: "Account email used for Jira API basic auth"
+    prompt: "Jira account email"
+    secret: false
+  - name: JIRA_API_TOKEN
+    description: "Jira API token (paired with JIRA_EMAIL for basic auth)"
+    prompt: "Jira API token"
+    url: "https://id.atlassian.com/manage-profile/security/api-tokens"
+    secret: true
+  - name: LINEAR_API_KEY
+    description: "Linear personal API key (GraphQL)"
+    prompt: "Linear API key"
+    url: "https://linear.app/settings/api"
+    secret: true
+  - name: GITHUB_TOKEN
+    description: "GitHub token with 'repo'/'issues' scope for creating issues"
+    prompt: "GitHub token"
+    url: "https://github.com/settings/tokens"
+    secret: true
