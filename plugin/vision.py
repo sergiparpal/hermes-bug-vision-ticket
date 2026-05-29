@@ -28,7 +28,12 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from .errors import BugTicketError
-from .schemas import BUG_REPORT_SCHEMA, CONFIDENCE_LEVELS, SEVERITY_LEVELS
+from .schemas import (
+    BUG_REPORT_INPUT_SCHEMA,
+    BUG_REPORT_SCHEMA,
+    CONFIDENCE_LEVELS,
+    SEVERITY_LEVELS,
+)
 
 # Accepted screenshot extensions -> MIME type.
 _IMAGE_MIME = {
@@ -231,19 +236,42 @@ def extract_bug_report(ctx, image_path: str, *, purpose: str = "bug-vision-extra
     """
     path, mime = resolve_image(image_path)
 
+    # Bounded read of the validated path: read at most the cap (+1 to detect
+    # overflow) from a single handle so a file swapped after resolve_image's stat
+    # can't make us read an unbounded / much larger file into memory.
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as fh:
+            data = fh.read(_MAX_IMAGE_BYTES + 1)
     except OSError as exc:
         raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise BugTicketError(
+            "image_too_large",
+            f"Screenshot exceeds the {_MAX_IMAGE_BYTES}-byte limit.",
+        )
+    if not data:
+        raise BugTicketError("empty_image", f"{path} is empty.")
 
-    result = ctx.llm.complete_structured(
-        instructions=SYSTEM_INSTRUCTIONS,
-        input=[{"type": "image", "data": data, "mime_type": mime, "file_name": path.name}],
-        json_schema=BUG_REPORT_SCHEMA,
-        schema_name="bug_report",
-        max_tokens=1500,
-        purpose=purpose,
-    )
+    # The host validates model output against whatever json_schema we pass and
+    # raises ValueError on mismatch, BEFORE returning. We pass the relaxed
+    # BUG_REPORT_INPUT_SCHEMA (so normalization can fix off-enum values) and still
+    # convert any host-side validation/parse failure into a clean structured error
+    # rather than letting it bubble up as a generic internal_error.
+    try:
+        result = ctx.llm.complete_structured(
+            instructions=SYSTEM_INSTRUCTIONS,
+            input=[{"type": "image", "data": data, "mime_type": mime, "file_name": path.name}],
+            json_schema=BUG_REPORT_INPUT_SCHEMA,
+            schema_name="bug_report",
+            max_tokens=1500,
+            purpose=purpose,
+        )
+    except ValueError as exc:
+        raise BugTicketError(
+            "vision_unparseable",
+            "The vision model did not return usable JSON. Ensure the active model "
+            "is multimodal and supports structured/JSON output.",
+        ) from exc
 
     raw = _parsed_from_result(result)
     report = _normalize(raw)

@@ -120,6 +120,24 @@ def _short_body(resp: requests.Response, limit: int = 200) -> str:
     return text[:limit]
 
 
+def _json_body(resp: requests.Response) -> Dict[str, Any]:
+    """Parse a JSON object body, mapping a non-JSON 2xx response to a clean error.
+
+    ``resp.json()`` raises ``requests...JSONDecodeError`` (a ``ValueError``) on a
+    non-JSON/empty body — without this it would escape the structured-error
+    mapping and surface as a generic internal_error. Non-dict JSON is treated as
+    an empty mapping (callers only read keys).
+    """
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise BugTicketError(
+            "tracker_error",
+            f"Tracker returned a non-JSON {resp.status_code} response. {_short_body(resp)}",
+        ) from exc
+    return data if isinstance(data, dict) else {}
+
+
 # ---------------------------------------------------------------------------
 # Jira
 # ---------------------------------------------------------------------------
@@ -157,7 +175,7 @@ class JiraClient:
             creds_hint=self._CREDS,
             notfound_hint="Jira search endpoint not found; check JIRA_BASE_URL.",
         )
-        issues = (resp.json() or {}).get("issues") or []
+        issues = _json_body(resp).get("issues") or []
         if not issues:
             return None
         return f"{self.base_url}/browse/{issues[0]['key']}"
@@ -172,7 +190,7 @@ class JiraClient:
             creds_hint=self._CREDS,
             notfound_hint=f"Jira project '{project}' or issue type not found.",
         )
-        data = resp.json() or {}
+        data = _json_body(resp)
         key = data.get("key", "")
         return {"url": f"{self.base_url}/browse/{key}", "id": str(data.get("id", key))}
 
@@ -210,7 +228,7 @@ class LinearClient:
             json_body={"query": query, "variables": variables},
             creds_hint=self._CREDS,
         )
-        body = resp.json() or {}
+        body = _json_body(resp)
         if body.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in body["errors"])[:200]
             # Linear reports auth failures as GraphQL errors with HTTP 200.
@@ -272,7 +290,7 @@ class GitHubClient:
             params={"q": dedup["q"], "per_page": 1},
             creds_hint=self._CREDS,
         )
-        items = (resp.json() or {}).get("items") or []
+        items = _json_body(resp).get("items") or []
         if not items:
             return None
         return items[0].get("html_url")
@@ -286,7 +304,7 @@ class GitHubClient:
             creds_hint=self._CREDS,
             notfound_hint=f"GitHub repo '{project}' not found, or token lacks access.",
         )
-        data = resp.json() or {}
+        data = _json_body(resp)
         return {"url": data.get("html_url", ""), "id": str(data.get("number", data.get("id", "")))}
 
 

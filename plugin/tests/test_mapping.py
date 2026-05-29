@@ -112,6 +112,19 @@ def test_jira_dedup_jql_escapes_quotes():
     assert '\\"hi\\"' in d["jql"]  # quotes escaped for JQL
 
 
+def test_jira_dedup_escapes_backslash_and_all_interpolated_fields():
+    # Untrusted title with a backslash + quote, and a template that also
+    # interpolates {summary} — every field must be escaped, backslash first.
+    bug = dict(BUG, title='path\\to "x"', summary='he "said"')
+    cfg = dict(JIRA_CFG, dedup={
+        "enabled": True,
+        "jql_template": 'summary ~ "{title}" OR description ~ "{summary}"',
+    })
+    d = mapping.build_dedup(bug, "jira", cfg, "ENG")
+    assert "\\\\" in d["jql"]            # the single backslash was doubled
+    assert 'he \\"said\\"' in d["jql"]   # quotes in {summary} were escaped too
+
+
 # --- Linear -----------------------------------------------------------------
 def test_linear_payload():
     out = mapping.to_payload(BUG, "linear", LINEAR_CFG)

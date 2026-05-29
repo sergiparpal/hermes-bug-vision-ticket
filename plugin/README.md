@@ -133,6 +133,14 @@ Creating a ticket is a side effect, so it is gated two ways:
 (`pre_tool_call` returning `{"action":"block", ...}` is the real blocking hook in
 Hermes; the `pre_approval_request` hook is observer-only and cannot deny.)
 
+> **The gate is model-mediated, not a hard human-in-the-loop.** The block message
+> is delivered to the agent, which re-invokes with `confirm=true`; Hermes provides
+> no human-approval surface for arbitrary plugin tools. So `confirm=true` reflects
+> the agent's decision. **Review the preview before instructing the agent to
+> confirm.** The gate prevents *accidental/implicit* creation; it does not stop a
+> determined prompt-injection that also sets `confirm=true`. The default preview
+> and idempotent dedup are the practical safety net.
+
 ---
 
 ## Install

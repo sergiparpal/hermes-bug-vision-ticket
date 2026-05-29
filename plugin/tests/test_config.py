@@ -102,7 +102,37 @@ def test_invalid_yaml(home):
     _write(home, "targets: : : not yaml\n  - broken")
     with pytest.raises(BugTicketError) as ei:
         config.load_config()
-    assert ei.value.error in {"config_invalid_yaml", "config_invalid"}
+    assert ei.value.error == "config_invalid_yaml"
+
+
+def test_non_mapping_yaml(home):
+    _write(home, "- a\n- b\n")  # valid YAML, but a list, not a mapping
+    with pytest.raises(BugTicketError) as ei:
+        config.load_config()
+    assert ei.value.error == "config_invalid"
+
+
+def test_invalid_target_value(home):
+    _write(home, "targets:\n  github_issues: not-a-mapping\n")
+    with pytest.raises(BugTicketError) as ei:
+        config.load_config()
+    assert ei.value.error == "config_invalid_target"
+
+
+def test_default_target_not_configured(home):
+    _write(home, "default_target: linear\ntargets:\n  github_issues:\n    repo: a/b\n")
+    cfg = config.load_config()
+    with pytest.raises(BugTicketError) as ei:
+        config.resolve_target_name(cfg, None)
+    assert ei.value.error == "default_target_not_configured"
+
+
+def test_secret_env_var_not_expanded(home, monkeypatch):
+    # A stray ${GITHUB_TOKEN} in config must NOT leak the secret into a value.
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_supersecret")
+    _write(home, "targets:\n  github_issues:\n    repo: a/b\n    default_labels: ['${GITHUB_TOKEN}']\n")
+    cfg = config.load_config()
+    assert cfg["targets"]["github_issues"]["default_labels"] == [""]  # expanded to empty, not the token
 
 
 def test_no_targets(home):

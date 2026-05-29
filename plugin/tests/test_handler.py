@@ -157,6 +157,96 @@ def test_target_override(env, monkeypatch):
     assert out["success"] is False and out["error"] == "target_not_configured"
 
 
+def test_internal_error_catch_all(env, monkeypatch):
+    # An unexpected (non-BugTicketError) failure must become a structured
+    # internal_error JSON string, never crash the agent loop.
+    from hermes_plugins.hermes_bug_vision_ticket import config as cfg_mod
+
+    def boom():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(cfg_mod, "load_config", boom)
+    out = _run(env, confirm=True)
+    assert out["success"] is False and out["error"] == "internal_error"
+
+
+JIRA_CONFIG = """\
+default_target: jira
+targets:
+  jira:
+    base_url: https://acme.atlassian.net
+    project_key: ENG
+    issue_type: Bug
+    severity_map:
+      blocker:  { priority: { name: Highest } }
+      critical: { priority: { name: High } }
+      major:    { priority: { name: Medium } }
+      minor:    { priority: { name: Low } }
+      trivial:  { priority: { name: Lowest } }
+    dedup:
+      enabled: true
+      jql_template: 'project = {project_key} AND summary ~ "{title}"'
+"""
+
+LINEAR_CONFIG = """\
+default_target: linear
+targets:
+  linear:
+    team_id: team-1
+    severity_map:
+      blocker:  { priority: 1 }
+      critical: { priority: 1 }
+      major:    { priority: 2 }
+      minor:    { priority: 3 }
+      trivial:  { priority: 4 }
+    dedup: { enabled: true }
+"""
+
+
+def test_jira_end_to_end(env, monkeypatch):
+    monkeypatch.setenv("JIRA_EMAIL", "bot@acme.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jt")
+    (env["home"] / "bug-tickets.yaml").write_text(JIRA_CONFIG, encoding="utf-8")
+
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((method, url))
+        if url.endswith("/rest/api/3/search/jql"):
+            return FakeResp(200, {"issues": []})
+        if url.endswith("/rest/api/3/issue"):
+            return FakeResp(201, {"key": "ENG-5", "id": "5000"})
+        raise AssertionError(f"unexpected {method} {url}")
+
+    monkeypatch.setattr(clients.requests, "request", fake)
+    out = _run(env, confirm=True)
+    assert out["created"] is True
+    assert out["ticket_url"] == "https://acme.atlassian.net/browse/ENG-5"
+    assert any(u.endswith("/rest/api/3/search/jql") for _m, u in seen)  # dedup ran
+
+
+def test_linear_end_to_end_dedup_short_circuits(env, monkeypatch):
+    monkeypatch.setenv("LINEAR_API_KEY", "lk")
+    (env["home"] / "bug-tickets.yaml").write_text(LINEAR_CONFIG, encoding="utf-8")
+
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((method, url, kw["json"]["query"]))
+        query = kw["json"]["query"]
+        if "issueSearch" in query:  # dedup: return a title-matching node
+            return FakeResp(200, {"data": {"issueSearch": {"nodes": [
+                {"id": "1", "url": "https://linear.app/acme/issue/ENG-1", "title": REPORT["title"]}
+            ]}}})
+        raise AssertionError("issueCreate must not be called when a duplicate exists")
+
+    monkeypatch.setattr(clients.requests, "request", fake)
+    out = _run(env, confirm=True)
+    assert out.get("deduped") is True
+    assert out["ticket_url"] == "https://linear.app/acme/issue/ENG-1"
+    assert all("issueCreate" not in q for *_x, q in seen)  # never created
+
+
 # --- approval hook ----------------------------------------------------------
 def test_hook_ignores_other_tools():
     assert pkg._on_pre_tool_call(tool_name="terminal", args={}) is None

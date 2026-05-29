@@ -306,9 +306,11 @@ def build_dedup(
         template = dedup.get("jql_template")
         if not template:
             return None
-        # Escape double quotes in title so the JQL string literal stays valid.
+        # Every interpolated value (all model-extracted, hence untrusted) is
+        # escaped for a JQL string literal: backslash first, THEN double quote, so
+        # a trailing backslash can't terminate the literal early.
         ctx = _template_context(bug_report, project)
-        ctx["title"] = ctx["title"].replace('"', '\\"')
+        ctx = {k: v.replace("\\", "\\\\").replace('"', '\\"') for k, v in ctx.items()}
         return {"kind": "jql", "jql": _expand_str(template, ctx).strip()}
 
     if target == "github_issues":

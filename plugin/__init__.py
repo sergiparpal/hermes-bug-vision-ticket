@@ -9,10 +9,18 @@ vision extract -> map to tracker payload -> dedup -> preview OR create.
 
 Approval gate (Q4 = yes): ticket creation is a side effect, so it is gated two
 ways. (1) The handler never POSTs unless ``confirm=true`` — the default is a
-non-destructive preview. (2) A ``pre_tool_call`` hook blocks unconfirmed calls
-when ``require_approval`` is on in the config (the verified, real blocking hook;
-``pre_approval_request`` is observer-only and cannot deny). Idempotent dedup
-returns an existing ticket without creating a duplicate.
+non-destructive preview the operator can review. (2) A ``pre_tool_call`` hook
+blocks unconfirmed calls when ``require_approval`` is on in the config (the
+verified, real blocking hook; ``pre_approval_request`` is observer-only and
+cannot deny). Idempotent dedup returns an existing ticket without creating a
+duplicate.
+
+Note: this gate is model-mediated, not a hardware human-in-the-loop. The block
+message goes to the agent, which re-invokes with ``confirm=true``; Hermes has no
+human-approval surface for arbitrary plugin tools. So ``confirm=true`` reflects
+the agent's decision — review the preview before instructing the agent to
+confirm. The value is preventing accidental/implicit creation, not defeating a
+determined prompt-injection that also sets ``confirm=true``.
 """
 
 from __future__ import annotations

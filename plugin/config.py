@@ -26,6 +26,12 @@ CONFIG_FILENAME = "bug-tickets.yaml"
 
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# Credential env vars are NEVER expanded into config values: ${...} expansion is
+# for non-secret structure (e.g. base URLs), and a stray ${GITHUB_TOKEN} in, say,
+# a custom_fields value would otherwise be copied verbatim into a ticket payload.
+# Such references expand to "" instead, so a secret can't leak into tracker content.
+_SECRET_ENV_DENYLIST = frozenset({"JIRA_API_TOKEN", "LINEAR_API_KEY", "GITHUB_TOKEN"})
+
 
 def hermes_home() -> Path:
     """Resolve the Hermes home dir (profile-aware), never hardcoding ~/.hermes alone."""
@@ -42,10 +48,17 @@ def config_path() -> Path:
     return hermes_home() / CONFIG_FILENAME
 
 
+def _expand_one(name: str) -> str:
+    """Expand a single ${VAR} ref, refusing credential vars (-> '')."""
+    if name in _SECRET_ENV_DENYLIST:
+        return ""
+    return os.environ.get(name, "")
+
+
 def _expand_env(value: Any) -> Any:
-    """Recursively expand ``${VAR}`` refs in strings using os.environ (unset -> '')."""
+    """Recursively expand ``${VAR}`` refs in strings using os.environ (unset/secret -> '')."""
     if isinstance(value, str):
-        return _ENV_REF.sub(lambda m: os.environ.get(m.group(1), ""), value)
+        return _ENV_REF.sub(lambda m: _expand_one(m.group(1)), value)
     if isinstance(value, list):
         return [_expand_env(v) for v in value]
     if isinstance(value, dict):

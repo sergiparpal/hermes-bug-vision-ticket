@@ -66,12 +66,44 @@ def test_github_create_success(creds, monkeypatch):
 
 
 def test_github_dedup_hit_and_miss(creds, monkeypatch):
-    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, {"items": [{"html_url": "https://github.com/acme/web/issues/3"}]}))
+    def hit(method, url, calls, **kw):
+        assert method == "GET"                       # correct verb
+        assert url.endswith("/search/issues")        # correct endpoint
+        assert kw["params"]["q"] == "in:title bug"   # query forwarded
+        return FakeResp(200, {"items": [{"html_url": "https://github.com/acme/web/issues/3"}]})
+
+    patch_request(monkeypatch, hit)
     client = clients.make_client("github_issues", {"repo": "acme/web"})
-    assert client.find_duplicate({"kind": "github_search", "q": "x"}) == "https://github.com/acme/web/issues/3"
+    assert client.find_duplicate({"kind": "github_search", "q": "in:title bug"}) == "https://github.com/acme/web/issues/3"
 
     patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, {"items": []}))
     assert client.find_duplicate({"kind": "github_search", "q": "x"}) is None
+
+
+def test_github_non_json_2xx_is_tracker_error(creds, monkeypatch):
+    import requests as _rq
+
+    class BadJSON(FakeResp):
+        def json(self):
+            raise _rq.exceptions.JSONDecodeError("no json", "<html>", 0)
+
+    patch_request(monkeypatch, lambda m, u, c, **k: BadJSON(200))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "tracker_error"
+
+
+def test_github_connection_error_unreachable(creds, monkeypatch):
+    def handler(method, url, calls, **kw):
+        raise requests.exceptions.ConnectionError("no route")
+
+    calls = patch_request(monkeypatch, handler)
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "tracker_unreachable"
+    assert len(calls) == clients._MAX_RETRIES + 1  # connection errors are retried, bounded
 
 
 def test_github_401(creds, monkeypatch):
@@ -139,9 +171,15 @@ def test_jira_create_success(creds, monkeypatch):
 
 
 def test_jira_dedup(creds, monkeypatch):
-    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, {"issues": [{"key": "ENG-9"}]}))
+    def hit(method, url, calls, **kw):
+        assert method == "POST"
+        assert url.endswith("/rest/api/3/search/jql")
+        assert kw["json"]["jql"] == "project = ENG"
+        return FakeResp(200, {"issues": [{"key": "ENG-9"}]})
+
+    patch_request(monkeypatch, hit)
     client = clients.make_client("jira", {"base_url": "https://acme.atlassian.net"})
-    assert client.find_duplicate({"kind": "jql", "jql": "x"}) == "https://acme.atlassian.net/browse/ENG-9"
+    assert client.find_duplicate({"kind": "jql", "jql": "project = ENG"}) == "https://acme.atlassian.net/browse/ENG-9"
 
     patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, {"issues": []}))
     assert client.find_duplicate({"kind": "jql", "jql": "x"}) is None

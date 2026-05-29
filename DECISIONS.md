@@ -98,6 +98,35 @@ text I/O uses `encoding="utf-8"`, images read as binary.
   `HERMES_HOME/plugins/hermes-bug-vision-ticket`, enabling it in `config.yaml`,
   and calling `PluginManager().discover_and_load()`.
 
+## Adversarial review pass (post-Phase 7)
+
+A 4-lens independent review (contract / correctness / security / tests) against
+the actual host source found the contract usage clean and surfaced fixes, all
+applied:
+
+- **HIGH (correctness):** the host validates `complete_structured` output against
+  whatever `json_schema` we pass and raises *before* our code runs
+  (`agent/plugin_llm.py:472-482`) — so passing the strict `BUG_REPORT_SCHEMA`
+  made the severity-synonym normalization dead and turned common output
+  (`severity:"high"`) into a generic `internal_error`. Fix: hand the host a
+  relaxed `BUG_REPORT_INPUT_SCHEMA` (no enums / `additionalProperties:true` / no
+  required) for model guidance only; strict `BUG_REPORT_SCHEMA` re-validates
+  locally after normalization; the host call is wrapped to convert any
+  `ValueError` into a clean `vision_unparseable`.
+- **Security:** bounded the image read to the size cap (TOCTOU/uncapped-read);
+  refused expanding credential env vars (`${GITHUB_TOKEN}` etc.) into config
+  values; hardened JQL dedup escaping (backslash + all interpolated fields);
+  softened the approval-gate docs to state honestly that confirmation is
+  model-mediated (review the preview before confirming), not a hard human gate.
+- **Robustness:** a 2xx response with a non-JSON body now maps to a structured
+  `tracker_error` instead of escaping as `internal_error`.
+- **Tests:** +11 — internal_error catch-all, Jira & Linear end-to-end through the
+  handler, `ConnectionError -> tracker_unreachable`, dedup verb/endpoint/param
+  assertions, tightened YAML-error test, `config_invalid` / `config_invalid_target`
+  / `default_target_not_configured` / secret-denylist, and the
+  `schema_name`/`max_tokens`/`purpose` half of the vision call contract. Suite
+  76 -> 87, all green.
+
 ## Other autonomous choices
 
 - Cloned `hermes-agent` shallow (`--depth 1`); built `.venv` with `pip install -e

@@ -12,7 +12,7 @@ import pytest
 
 from hermes_plugins.hermes_bug_vision_ticket import vision
 from hermes_plugins.hermes_bug_vision_ticket.errors import BugTicketError
-from hermes_plugins.hermes_bug_vision_ticket.schemas import BUG_REPORT_SCHEMA
+from hermes_plugins.hermes_bug_vision_ticket.schemas import BUG_REPORT_INPUT_SCHEMA
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-pixels" * 8
 
@@ -81,7 +81,17 @@ def test_structured_call_is_shaped_correctly(tmp_path):
 
     (call,) = ctx.llm.calls
     assert call["instructions"] == vision.SYSTEM_INSTRUCTIONS
-    assert call["json_schema"] is BUG_REPORT_SCHEMA
+    # We hand the host the RELAXED schema (so normalization can fix off-enum
+    # output the host would otherwise reject); the strict schema is validated
+    # locally afterwards.
+    assert call["json_schema"] is BUG_REPORT_INPUT_SCHEMA
+    assert "required" not in BUG_REPORT_INPUT_SCHEMA  # host must not pre-reject
+    assert BUG_REPORT_INPUT_SCHEMA["additionalProperties"] is True
+    assert "enum" not in BUG_REPORT_INPUT_SCHEMA["properties"]["severity"]
+    # Other half of the call contract.
+    assert call["schema_name"] == "bug_report"
+    assert call["max_tokens"] == 1500
+    assert call["purpose"] == "bug-vision-extract"
     blocks = call["input"]
     assert len(blocks) == 1
     img_block = blocks[0]
@@ -142,6 +152,21 @@ def test_unparseable_output_rejected(tmp_path):
     ctx = _FakeCtx(_FakeResult(parsed=None, text="not json at all", content_type="text"))
     with pytest.raises(BugTicketError) as ei:
         vision.extract_bug_report(ctx, str(_png(tmp_path)))
+    assert ei.value.error == "vision_unparseable"
+
+
+def test_host_validation_valueerror_becomes_structured_error(tmp_path):
+    # The host raises ValueError if its own schema validation/parse fails; we
+    # convert that to a clean vision_unparseable instead of a generic crash.
+    class _RaisingLLM:
+        def complete_structured(self, **kwargs):
+            raise ValueError("Plugin LLM structured output did not match schema: ...")
+
+    class _Ctx:
+        llm = _RaisingLLM()
+
+    with pytest.raises(BugTicketError) as ei:
+        vision.extract_bug_report(_Ctx(), str(_png(tmp_path)))
     assert ei.value.error == "vision_unparseable"
 
 
