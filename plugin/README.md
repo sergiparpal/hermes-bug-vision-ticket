@@ -22,9 +22,9 @@ the ticket — returning the ticket URL.
 
 **Returns** (a JSON string — bounded to a URL + short summary, never the whole body):
 
-- **Preview** (`confirm` false): `{"success": true, "preview": true, "title", "severity", "target", "project", "summary", "message"}`
+- **Preview** (`confirm` false): `{"success": true, "preview": true, "requires_confirmation": true, "title", "severity", "target", "project", "summary", "message"}`
 - **Created** (`confirm` true): `{"success": true, "created": true, "ticket_url", "ticket_id", "title", "summary", "target"}`
-- **Deduped** (an open ticket with this title already exists): `{"success": true, "deduped": true, "ticket_url", "title", "target"}`
+- **Deduped** (an open ticket with this title already exists): `{"success": true, "deduped": true, "ticket_url", "title", "target", "message"}`
 - **Error**: `{"success": false, "error": "<code>", "remediation": "<how to fix>"}`
 
 ### How it works
@@ -50,8 +50,8 @@ Secrets are **never** stored here; tokens come from environment variables.
 String values may reference env vars with `${VAR}` (expanded at load) — use this
 only for **non-secret structure** (e.g. a base URL). A `${VAR}` whose name is one of
 the tracker credentials *or* simply looks like a secret (contains `TOKEN`, `SECRET`,
-`PASSWORD`, `KEY`, `CREDENTIAL`, …) expands to an empty string, so a secret can
-never be copied into a ticket payload.
+`PASSWORD`/`PASSWD`, `CREDENTIAL`, or a `*_KEY` form like `API_KEY`/`ACCESS_KEY`/`PRIVATE_KEY`)
+expands to an empty string, so a secret can never be copied into a ticket payload.
 
 ```yaml
 default_target: github_issues   # used when the tool is called without target=
@@ -196,7 +196,8 @@ not sandboxed). It can:
 - **Make authenticated HTTPS writes to your issue tracker** — it reads tracker
   tokens from environment variables (only when a tracker is used) and creates
   issues. Every request is HTTPS-only with an explicit timeout and bounded retries
-  (never on 4xx). **Redirects are not followed**, and a `base_url` resolving to a
+  (on timeouts, connection errors, `500/502/503/504`, and rate limits — never on an
+  ordinary 4xx). **Redirects are not followed**, and a `base_url` resolving to a
   loopback/link-local IP literal (incl. the cloud-metadata endpoint) is refused, so
   an authenticated request can't be bounced to an internal host. Tokens are never
   logged or echoed in errors.
