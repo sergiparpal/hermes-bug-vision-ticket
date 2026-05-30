@@ -17,11 +17,113 @@ during ``register(ctx)`` is cheap and safe.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, TypedDict
 
-# The set of trackers v1 supports. Kept here so the tool schema enum, the config
-# loader, and the client factory stay in sync from a single source of truth.
-SUPPORTED_TARGETS = ("jira", "linear", "github_issues")
+# ---------------------------------------------------------------------------
+# Per-tracker registry (single source of truth)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TrackerSpec:
+    """Every per-tracker fact the rest of the plugin looks up by target name.
+
+    Consolidating these here means "add a tracker" touches ONE row in this table
+    plus the target's payload builder (mapping.py) and REST client (clients.py) —
+    instead of a dozen scattered string literals and per-target maps. In
+    particular ``dedup_kind`` is the contract tag shared by ``mapping.build_dedup``
+    (producer) and ``clients.*.find_duplicate`` (consumer), so it lives in exactly
+    one place rather than being duplicated as a magic string across both modules.
+
+    This stays pure data (no builder/client references) so ``schemas`` remains an
+    import leaf — mapping/clients read from it, never the reverse.
+    """
+
+    name: str
+    project_config_key: str  # config key holding the project/board/repo id
+    dedup_kind: str  # "kind" tag on the dedup descriptor build_dedup emits
+    reserved_fields: frozenset[str]  # core fields a config block may not override
+
+
+TRACKER_SPECS: dict[str, TrackerSpec] = {
+    "jira": TrackerSpec(
+        name="jira",
+        project_config_key="project_key",
+        dedup_kind="jql",
+        reserved_fields=frozenset({"project", "issuetype", "summary", "description"}),
+    ),
+    "linear": TrackerSpec(
+        name="linear",
+        project_config_key="team_id",
+        dedup_kind="linear",
+        reserved_fields=frozenset({"teamId", "title", "description"}),
+    ),
+    "github_issues": TrackerSpec(
+        name="github_issues",
+        project_config_key="repo",
+        dedup_kind="github_search",
+        reserved_fields=frozenset(),
+    ),
+}
+
+# Derived from the registry so the tool-schema enum, the config loader, and the
+# client/builder factories all stay in sync from the single table above.
+SUPPORTED_TARGETS: tuple[str, ...] = tuple(TRACKER_SPECS)
+
+
+# ---------------------------------------------------------------------------
+# Typed dict contracts crossing module boundaries
+# ---------------------------------------------------------------------------
+# These document + statically check the (previously implicit) dict shapes passed
+# between layers. They are typing-only: zero runtime effect on the dicts, so the
+# JSON round-trip through the host and the `.get()`-style access are unchanged.
+class BugReport(TypedDict, total=False):
+    """Normalized vision-extraction result flowing vision -> mapping -> results.
+
+    ``total=False`` because only title/summary/severity/actual_behavior are
+    guaranteed (the strict-schema ``required`` set); the rest are filled when
+    inferable. The dict is still re-validated against ``BUG_REPORT_SCHEMA`` before
+    it is trusted.
+    """
+
+    title: str
+    summary: str
+    steps_to_reproduce: list[str]
+    expected_behavior: str
+    actual_behavior: str
+    severity: str
+    component_hint: str | None
+    ui_elements_observed: list[str]
+    visible_text: list[str]
+    confidence: str
+
+
+class MappedPayload(TypedDict):
+    """Return of ``mapping.to_payload``: the resolved create-issue request."""
+
+    target: str
+    project: str
+    title: str
+    create_payload: dict[str, Any]
+
+
+class DedupDescriptor(TypedDict, total=False):
+    """Return of ``mapping.build_dedup``; consumed by ``clients.*.find_duplicate``.
+
+    A tagged shape: ``kind`` selects which other keys are present
+    (``jql`` -> jql; ``github_search`` -> q + title; ``linear`` -> title).
+    """
+
+    kind: str
+    jql: str
+    q: str
+    title: str
+
+
+class CreatedIssue(TypedDict):
+    """Return of ``clients.*.create_issue``."""
+
+    url: str
+    id: str
 
 # Normalized severity ladder (highest -> lowest) and confidence levels. These are
 # the canonical enums the vision layer coerces model output into and the mapping

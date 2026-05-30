@@ -35,6 +35,7 @@ from .schemas import (
     BUG_REPORT_SCHEMA,
     CONFIDENCE_LEVELS,
     SEVERITY_LEVELS,
+    BugReport,
 )
 
 # Accepted screenshot extensions -> MIME type.
@@ -201,7 +202,7 @@ def _parsed_from_result(result: Any) -> dict[str, Any]:
     return parsed
 
 
-def _normalize(report: dict[str, Any]) -> dict[str, Any]:
+def _normalize(report: dict[str, Any]) -> BugReport:
     """Coerce a raw model report into a complete, well-typed BugReport.
 
     Severity/confidence are clamped into their enums; list/str fields are
@@ -283,7 +284,7 @@ def extract_bug_report(
     *,
     resolved: tuple[Path, str] | None = None,
     purpose: str = "bug-vision-extract",
-) -> dict[str, Any]:
+) -> BugReport:
     """Turn a screenshot into a validated, normalized BugReport dict.
 
     ``resolved`` may carry the ``(path, mime)`` from an earlier

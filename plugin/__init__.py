@@ -34,56 +34,10 @@ logger = logging.getLogger(__name__)
 TOOLSET = "bug_vision_ticket"
 TOOL_NAME = "report_bug_from_screenshot"
 
-_SUMMARY_MAX = 160
-
 
 def _json(obj: Any) -> str:
     """Serialize a handler result to the JSON string Hermes tool handlers must return."""
     return json.dumps(obj, ensure_ascii=False)
-
-
-def _short(text: str | None) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= _SUMMARY_MAX else text[: _SUMMARY_MAX - 1] + "…"
-
-
-def _deduped_result(target: str, ticket_url: str, title: str) -> dict[str, Any]:
-    return {
-        "success": True,
-        "deduped": True,
-        "target": target,
-        "ticket_url": ticket_url,
-        "title": title,
-        "message": "An open ticket with this title already exists; "
-                   "no duplicate was created.",
-    }
-
-
-def _preview_result(target: str, project: str, title: str, report: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "success": True,
-        "preview": True,
-        "requires_confirmation": True,
-        "target": target,
-        "project": project,
-        "title": title,
-        "severity": report.get("severity"),
-        "summary": _short(report.get("summary")),
-        "message": "Preview only — no ticket was created. Re-invoke with "
-                   "confirm=true to file it.",
-    }
-
-
-def _created_result(target: str, created: dict[str, Any], title: str, report: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "success": True,
-        "created": True,
-        "target": target,
-        "ticket_url": created.get("url", ""),
-        "ticket_id": created.get("id", ""),
-        "title": title,
-        "summary": _short(report.get("summary")),
-    }
 
 
 def _confirmed(args: dict[str, Any]) -> bool:
@@ -96,17 +50,15 @@ def _confirmed(args: dict[str, Any]) -> bool:
     ``"false"`` / ``"no"`` / ``"0"`` as True (any non-empty string is truthy),
     failing BOTH the preview default and the pre_tool_call approval gate OPEN.
     Only an explicit affirmative confirms; anything negative/ambiguous does not.
-    Both the handler and the hook route through this single helper so they can
-    never diverge.
+    Both the handler and the hook route through this single helper (and the shared
+    ``coerce_bool``) so they can never diverge.
     """
-    val = args.get("confirm")
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "yes", "1")
-    if isinstance(val, (int, float)):
-        return val == 1
-    return False
+    # Lazy import: __init__.py must keep every relative import inside a function so
+    # the module body stays importable in a non-package context (pytest collects
+    # this file directly; the host probes it). Mirrors the lazy imports below.
+    from .coerce import coerce_bool
+
+    return coerce_bool(args.get("confirm"), default=False, strict_numeric=True)
 
 
 def _run_pipeline(ctx, args: dict[str, Any]) -> str:
@@ -115,7 +67,7 @@ def _run_pipeline(ctx, args: dict[str, Any]) -> str:
     ``ctx`` is the PluginContext (for ``ctx.llm``). Kept module-level (rather
     than a closure) so it is directly unit-testable with a fake ctx.
     """
-    from . import clients, config, mapping, vision
+    from . import clients, config, mapping, results, vision
     from .errors import BugTicketError
 
     args = args if isinstance(args, dict) else {}
@@ -145,14 +97,14 @@ def _run_pipeline(ctx, args: dict[str, Any]) -> str:
         if dedup is not None:
             existing = client.find_duplicate(dedup)
             if existing:
-                return _json(_deduped_result(target, existing, title))
+                return _json(results.deduped_result(target, existing, title))
 
         # 6. Preview (safe default) vs. create.
         if not confirm:
-            return _json(_preview_result(target, project, title, report))
+            return _json(results.preview_result(target, project, title, report))
 
         created = client.create_issue(project, mapped["create_payload"])
-        return _json(_created_result(target, created, title, report))
+        return _json(results.created_result(target, created, title, report))
 
     except BugTicketError as exc:
         return _json(exc.to_payload())

@@ -27,12 +27,13 @@ import ipaddress
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 import requests
 
 from .errors import BugTicketError
+from .schemas import TRACKER_SPECS, CreatedIssue, DedupDescriptor
 
 DEFAULT_TIMEOUT = 15.0
 _MAX_RETRIES = 2          # total attempts = _MAX_RETRIES + 1
@@ -42,6 +43,20 @@ _RETRYABLE_STATUS = {500, 502, 503, 504}
 # Control chars (incl. C1) are scrubbed from any tracker body we echo back: the body
 # is untrusted/attacker-influenceable and ends up in a remediation string.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class TrackerClient(Protocol):
+    """Structural contract every tracker client satisfies.
+
+    Makes substitutability explicit (the registry/factory return this) and lets a
+    type checker catch a client whose ``find_duplicate``/``create_issue`` signature
+    drifts when a tracker is added. Protocol = structural, so the concrete clients
+    need no explicit base class.
+    """
+
+    def find_duplicate(self, dedup: DedupDescriptor) -> str | None: ...
+
+    def create_issue(self, project: str, payload: dict[str, Any]) -> CreatedIssue: ...
 
 
 def _check_request_host(url: str) -> None:
@@ -317,8 +332,8 @@ class JiraClient:
 
     _CREDS = "Check JIRA_EMAIL and JIRA_API_TOKEN."
 
-    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
-        if dedup.get("kind") != "jql":
+    def find_duplicate(self, dedup: DedupDescriptor) -> str | None:
+        if dedup.get("kind") != TRACKER_SPECS["jira"].dedup_kind:
             return None
         resp = _http(
             "POST",
@@ -334,7 +349,7 @@ class JiraClient:
             return None
         return f"{self.base_url}/browse/{issues[0]['key']}"
 
-    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> CreatedIssue:
         resp = _http(
             "POST",
             f"{self.base_url}/rest/api/3/issue",
@@ -404,8 +419,8 @@ class LinearClient:
             raise BugTicketError("tracker_error", f"Linear API error: {_echo(msg)}")
         return body.get("data") or {}
 
-    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
-        if dedup.get("kind") != "linear":
+    def find_duplicate(self, dedup: DedupDescriptor) -> str | None:
+        if dedup.get("kind") != TRACKER_SPECS["linear"].dedup_kind:
             return None
         title = (dedup.get("title") or "").strip()
         if not title:
@@ -417,7 +432,7 @@ class LinearClient:
                 return node.get("url")
         return None
 
-    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> CreatedIssue:
         data = self._graphql(_LINEAR_CREATE, {"input": payload})
         result = data.get("issueCreate") or {}
         if not result.get("success"):
@@ -447,8 +462,8 @@ class GitHubClient:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def find_duplicate(self, dedup: dict[str, Any]) -> str | None:
-        if dedup.get("kind") != "github_search":
+    def find_duplicate(self, dedup: DedupDescriptor) -> str | None:
+        if dedup.get("kind") != TRACKER_SPECS["github_issues"].dedup_kind:
             return None
         resp = _http(
             "GET",
@@ -468,7 +483,7 @@ class GitHubClient:
                 return item.get("html_url")
         return None
 
-    def create_issue(self, project: str, payload: dict[str, Any]) -> dict[str, str]:
+    def create_issue(self, project: str, payload: dict[str, Any]) -> CreatedIssue:
         resp = _http(
             "POST",
             # project is validated to owner/name in mapping._resolve_project; quote
@@ -483,14 +498,14 @@ class GitHubClient:
         return {"url": data.get("html_url", ""), "id": str(data.get("number", data.get("id", "")))}
 
 
-_CLIENTS = {
+_CLIENTS: dict[str, type[TrackerClient]] = {
     "jira": JiraClient,
     "linear": LinearClient,
     "github_issues": GitHubClient,
 }
 
 
-def make_client(target: str, target_cfg: dict[str, Any]):
+def make_client(target: str, target_cfg: dict[str, Any]) -> TrackerClient:
     """Construct the client for ``target`` (reads + validates its env credentials)."""
     cls = _CLIENTS.get(target)
     if cls is None:

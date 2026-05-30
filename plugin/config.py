@@ -19,6 +19,7 @@ from typing import Any
 
 import yaml
 
+from .coerce import coerce_bool
 from .errors import BugTicketError
 from .schemas import SUPPORTED_TARGETS
 
@@ -211,22 +212,17 @@ def _as_bool(value: Any, *, default: bool) -> bool:
     """Interpret a YAML/config value as a bool, tolerant of quoted strings.
 
     A quoted "false"/"no"/"0"/"off" parses as a *string*, which a naive bool()
-    reads as True — for an approval gate that would silently flip it open. This
-    mirrors the strict string handling in __init__._confirmed. Unrecognized or
-    absent values fall back to ``default``.
+    reads as True — for an approval gate that would silently flip it open. Shares
+    the coercion core with ``__init__._confirmed`` via ``coerce.coerce_bool``;
+    this is the tolerant variant (adds ``on``/``off``, a caller ``default``, and
+    treats any non-zero number as True). Unrecognized/absent -> ``default``.
     """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in ("true", "yes", "1", "on"):
-            return True
-        if token in ("false", "no", "0", "off", ""):
-            return False
-        return default
-    if isinstance(value, (int, float)):
-        return value != 0
-    return default
+    return coerce_bool(
+        value,
+        default=default,
+        true_tokens=("true", "yes", "1", "on"),
+        false_tokens=("false", "no", "0", "off", ""),
+    )
 
 
 def require_approval(cfg: dict[str, Any]) -> bool:

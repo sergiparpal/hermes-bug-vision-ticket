@@ -18,10 +18,16 @@ error.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .errors import BugTicketError
-from .schemas import SUPPORTED_TARGETS
+from .schemas import (
+    SUPPORTED_TARGETS,
+    TRACKER_SPECS,
+    BugReport,
+    DedupDescriptor,
+    MappedPayload,
+)
 
 _PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 _JIRA_SUMMARY_MAX = 255
@@ -60,20 +66,21 @@ _GH_QUALIFIER_CHARS = re.compile(r'[":]')
 
 # Core fields a per-target builder owns; a severity_map / custom_fields entry must
 # not silently overwrite them (a colliding key is a config error, not a clobber).
-_JIRA_RESERVED = frozenset({"project", "issuetype", "summary", "description"})
-_LINEAR_RESERVED = frozenset({"teamId", "title", "description"})
+# Sourced from the per-tracker registry so they have a single definition site.
+_JIRA_RESERVED = TRACKER_SPECS["jira"].reserved_fields
+_LINEAR_RESERVED = TRACKER_SPECS["linear"].reserved_fields
 
 
 # ---------------------------------------------------------------------------
 # Template expansion
 # ---------------------------------------------------------------------------
-def _template_context(bug_report: dict[str, Any], project: str) -> dict[str, str]:
+def _template_context(bug_report: BugReport, project: str) -> dict[str, str]:
     """Flat string context for {placeholder} expansion. None -> ''."""
     def s(key: str) -> str:
         v = bug_report.get(key)
         return "" if v is None else str(v)
 
-    return {
+    ctx = {
         "title": s("title"),
         "summary": s("summary"),
         "severity": s("severity"),
@@ -82,10 +89,13 @@ def _template_context(bug_report: dict[str, Any], project: str) -> dict[str, str
         "expected_behavior": s("expected_behavior"),
         "actual_behavior": s("actual_behavior"),
         "project": project,
-        "project_key": project,
-        "team_id": project,
-        "repo": project,
     }
+    # Each tracker's project config-key doubles as a placeholder alias for the
+    # resolved project; derive them from the registry so a new tracker's alias is
+    # picked up automatically (no per-target literal to maintain here).
+    for spec in TRACKER_SPECS.values():
+        ctx[spec.project_config_key] = project
+    return ctx
 
 
 def _expand_str(template: str, tmpl_ctx: dict[str, str]) -> str:
@@ -217,7 +227,7 @@ def _render_adf(bug_report: dict[str, Any]) -> dict[str, Any]:
 # Helpers shared by per-target builders
 # ---------------------------------------------------------------------------
 def _resolve_project(target: str, cfg: dict[str, Any], override: str | None) -> str:
-    field = {"jira": "project_key", "linear": "team_id", "github_issues": "repo"}[target]
+    field = TRACKER_SPECS[target].project_config_key
     value = (override or cfg.get(field) or "").strip()
     if not value:
         raise BugTicketError(
@@ -285,7 +295,7 @@ def _guard_reserved(extra: dict[str, Any], reserved: frozenset, source: str, tar
 # Per-target payload builders
 # ---------------------------------------------------------------------------
 def _jira_payload(
-    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+    bug_report: BugReport, cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "project": {"key": project},
@@ -313,7 +323,7 @@ def _jira_payload(
 
 
 def _linear_payload(
-    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+    bug_report: BugReport, cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "teamId": project,
@@ -336,7 +346,7 @@ def _linear_payload(
 
 
 def _github_payload(
-    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+    bug_report: BugReport, cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
 ) -> dict[str, Any]:
     # No custom_fields support here: a GitHub issue is title/body/labels only, so
     # only Jira maps custom_fields. Severity contributes labels (below).
@@ -355,7 +365,12 @@ def _github_payload(
     return payload
 
 
-_BUILDERS = {
+# A payload builder: (report, target_cfg, resolved_project, template_ctx) -> body.
+# Declaring the shape makes the registry's contract explicit and catches a builder
+# whose signature drifts when a tracker is added.
+_Builder = Callable[[BugReport, dict[str, Any], str, dict[str, str]], dict[str, Any]]
+
+_BUILDERS: dict[str, _Builder] = {
     "jira": _jira_payload,
     "linear": _linear_payload,
     "github_issues": _github_payload,
@@ -363,11 +378,11 @@ _BUILDERS = {
 
 
 def to_payload(
-    bug_report: dict[str, Any],
+    bug_report: BugReport,
     target: str,
     target_cfg: dict[str, Any],
     project: str | None = None,
-) -> dict[str, Any]:
+) -> MappedPayload:
     """Build the create-issue request for ``target``.
 
     Returns {"target", "project", "title", "create_payload"}. Raises
@@ -398,11 +413,11 @@ def to_payload(
 # Dedup query building (template expansion lives here; the network call is in clients)
 # ---------------------------------------------------------------------------
 def build_dedup(
-    bug_report: dict[str, Any],
+    bug_report: BugReport,
     target: str,
     target_cfg: dict[str, Any],
     project: str,
-) -> dict[str, Any] | None:
+) -> DedupDescriptor | None:
     """Build the dedup search descriptor for a target, or None if disabled.
 
     Returns one of:
@@ -424,7 +439,10 @@ def build_dedup(
         # "{title}") — the escaping only protects a quoted position.
         tmpl_ctx = _template_context(bug_report, project)
         tmpl_ctx = {k: _jql_escape(v) for k, v in tmpl_ctx.items()}
-        return {"kind": "jql", "jql": _expand_str(template, tmpl_ctx).strip()}
+        return {
+            "kind": TRACKER_SPECS[target].dedup_kind,
+            "jql": _expand_str(template, tmpl_ctx).strip(),
+        }
 
     if target == "github_issues":
         template = dedup.get("search_template")
@@ -436,13 +454,13 @@ def build_dedup(
         # also returned so the client can verify the matched issue (see find_duplicate).
         tmpl_ctx = _github_search_safe(_template_context(bug_report, project))
         return {
-            "kind": "github_search",
+            "kind": TRACKER_SPECS[target].dedup_kind,
             "q": _expand_str(template, tmpl_ctx).strip(),
             "title": (bug_report.get("title") or "").strip(),
         }
 
     if target == "linear":
-        return {"kind": "linear", "title": bug_report.get("title", "")}
+        return {"kind": TRACKER_SPECS[target].dedup_kind, "title": bug_report.get("title", "")}
 
     return None
 

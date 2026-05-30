@@ -222,7 +222,41 @@ mocked (no provider, no network, no tokens):
 ```bash
 # from inside the hermes-agent venv:
 scripts/run_tests.sh dev-plugins/hermes-bug-vision-ticket/tests/
+
+# lint (ruff PLW1514 is the one enforced rule):
+.venv/bin/python -m ruff check --select PLW1514 --preview dev-plugins/hermes-bug-vision-ticket/
 ```
+
+### Project layout
+
+One tool, one pipeline. `_run_pipeline` in `__init__.py` orchestrates a chain of
+single-responsibility modules:
+
+| Module | Responsibility |
+|--------|----------------|
+| `__init__.py` | `register(ctx)`, the `_run_pipeline` orchestrator, and the `pre_tool_call` approval hook — the only module that talks to the host `ctx`. |
+| `schemas.py` | **Single source of truth:** the per-tracker `TRACKER_SPECS` registry, the tool + BugReport JSON schemas, and the `TypedDict` contracts (`BugReport`, `MappedPayload`, `DedupDescriptor`, `CreatedIssue`) passed between layers. An import leaf. |
+| `config.py` | Load/validate `<HERMES_HOME>/bug-tickets.yaml` — `${VAR}` expansion, target resolution. |
+| `vision.py` | Screenshot → validated, normalized `BugReport` (the one LLM call). |
+| `mapping.py` | **Pure:** `BugReport` + target config → tracker payload + dedup descriptor. No network/env/I/O. |
+| `clients.py` | One REST/GraphQL client per tracker (the only network I/O); each satisfies the `TrackerClient` protocol. |
+| `results.py` | The success-result JSON shapes (preview / created / deduped). |
+| `coerce.py` | `coerce_bool` — the shared, strict bool coercion behind the `confirm`/approval gate. |
+| `errors.py` | `BugTicketError` — the one structured-error type. |
+
+`mapping.py` (pure) and `clients.py` (I/O) never import each other — they
+communicate only through the `TypedDict` contracts in `schemas.py`, which keeps
+payload construction testable in isolation from the network.
+
+### Adding a tracker
+
+Per-tracker facts live in one table (`schemas.TRACKER_SPECS`), so support for a
+new tracker is one registry row plus a builder and a client:
+
+1. `schemas.py` — add a `TrackerSpec` row to `TRACKER_SPECS` (`name`, `project_config_key`, `dedup_kind`, `reserved_fields`). This one row drives `SUPPORTED_TARGETS` (and thus the tool enum + config validation), the project-field resolution, the dedup `kind` tag, and the reserved-field guard.
+2. `mapping.py` — add a `_<target>_payload` builder (register it in `_BUILDERS`) and a branch in `build_dedup`.
+3. `clients.py` — add a client class with `find_duplicate(dedup)` + `create_issue(project, payload)` and register it in `_CLIENTS`.
+4. `plugin.yaml` + this README — document the tracker's `requires_env` and its `severity_map`.
 
 See `../DECISIONS.md` for the pinned Hermes commit and the source-verified
 contract this plugin is built against.
