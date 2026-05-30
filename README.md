@@ -11,7 +11,6 @@ Issues, via a single tool: `report_bug_from_screenshot`.
 | [`plugin/`](plugin/) | **The plugin** (`plugin.yaml`, `register(ctx)`, vision/mapping/clients/config, tests). See [`plugin/README.md`](plugin/README.md). |
 | `hermes-agent/` | A local clone of the Hermes host — **gitignored** build/test tooling (provides `hermes_cli` for imports and `scripts/run_tests.sh` for CI-parity testing). Not part of this plugin's source. |
 | [`DECISIONS.md`](DECISIONS.md) | Pinned Hermes commit, the source-verified plugin contract, and every autonomous choice made building this. |
-| [`hermes-bug-vision-ticket-plan.md`](hermes-bug-vision-ticket-plan.md) | The original implementation plan. |
 
 ## Quickstart
 
