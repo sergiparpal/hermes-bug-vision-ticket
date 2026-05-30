@@ -142,6 +142,45 @@ def resolve_image(image_path: str) -> tuple[Path, str]:
     return real, mime
 
 
+def _read_image_bytes(path: Path) -> bytes:
+    """Read a validated image path into memory with a hard size cap and TOCTOU re-check.
+
+    Reads at most the cap (+1, to detect overflow) from a single handle so a file
+    swapped after ``resolve_image``'s stat can't make us read an unbounded / much
+    larger file into memory. Opens with O_NONBLOCK and requires a regular file via
+    ``fstat`` BEFORE reading, so a path swapped to a FIFO/device after validation
+    can neither block the open nor be read as a stream. Raises ``BugTicketError``.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BugTicketError("image_not_a_file", f"{path} is not a regular file.")
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read(_MAX_IMAGE_BYTES + 1)
+    except BugTicketError:
+        os.close(fd)  # fstat rejected it before fdopen took ownership of the fd
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)  # may already be closed if fdopen's context manager ran
+        except OSError:
+            pass
+        raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
+
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise BugTicketError(
+            "image_too_large",
+            f"Screenshot exceeds the {_MAX_IMAGE_BYTES}-byte limit.",
+        )
+    if not data:
+        raise BugTicketError("empty_image", f"{path} is empty.")
+    return data
+
+
 def _parsed_from_result(result: Any) -> dict[str, Any]:
     """Pull the parsed JSON object out of a PluginLlmStructuredResult-like value."""
     parsed = getattr(result, "parsed", None)
@@ -256,39 +295,7 @@ def extract_bug_report(
     schema mismatch). On success returns a dict conforming to BUG_REPORT_SCHEMA.
     """
     path, mime = resolved if resolved is not None else resolve_image(image_path)
-
-    # Bounded read of the validated path: read at most the cap (+1 to detect
-    # overflow) from a single handle so a file swapped after resolve_image's stat
-    # can't make us read an unbounded / much larger file into memory. Open with
-    # O_NONBLOCK and require a regular file via fstat BEFORE reading, so a path
-    # swapped to a FIFO/device after validation (TOCTOU) can neither block the open
-    # nor be read as a stream.
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise BugTicketError("image_not_a_file", f"{path} is not a regular file.")
-        with os.fdopen(fd, "rb") as fh:
-            data = fh.read(_MAX_IMAGE_BYTES + 1)
-    except BugTicketError:
-        os.close(fd)  # fstat rejected it before fdopen took ownership of the fd
-        raise
-    except OSError as exc:
-        try:
-            os.close(fd)  # may already be closed if fdopen's context manager ran
-        except OSError:
-            pass
-        raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
-    if len(data) > _MAX_IMAGE_BYTES:
-        raise BugTicketError(
-            "image_too_large",
-            f"Screenshot exceeds the {_MAX_IMAGE_BYTES}-byte limit.",
-        )
-    if not data:
-        raise BugTicketError("empty_image", f"{path} is empty.")
+    data = _read_image_bytes(path)
 
     # The host validates model output against whatever json_schema we pass and
     # raises ValueError on mismatch, BEFORE returning. We pass the relaxed

@@ -127,6 +127,44 @@ def _is_rate_limited(resp: requests.Response) -> bool:
     return False
 
 
+def _raise_for_status(
+    resp: requests.Response, *, creds_hint: str, notfound_hint: str
+) -> requests.Response:
+    """Interpret a final (non-retryable, non-rate-limited) HTTP response.
+
+    Returns the response on success, else raises the matching structured error.
+    Rate-limit handling stays in ``_http`` because it depends on retry state; this
+    covers the terminal status ladder so ``_http`` is about transport + retries and
+    this is about what a status code *means*.
+    """
+    status = resp.status_code
+    if status in (401, 403):
+        raise BugTicketError(
+            "invalid_credentials",
+            creds_hint or "Authentication failed; check your tracker credentials.",
+        )
+    if status == 404:
+        raise BugTicketError(
+            "not_found",
+            notfound_hint or "The requested project/repository was not found.",
+        )
+    if 300 <= status < 400:
+        # We deliberately do not follow redirects (see allow_redirects in _http). A
+        # redirect almost always means base_url is wrong (e.g. http->https upgrade,
+        # trailing-host change), so fail with a clear remediation.
+        raise BugTicketError(
+            "tracker_redirect",
+            f"Tracker responded with a redirect (HTTP {status}); redirects are "
+            "not followed. Check base_url points directly at the tracker API.",
+        )
+    if status >= 400:
+        raise BugTicketError(
+            "tracker_error",
+            f"Tracker returned HTTP {status}. {_echo(_short_body(resp))}",
+        )
+    return resp
+
+
 def _http(
     method: str,
     url: str,
@@ -194,31 +232,7 @@ def _http(
                     "The tracker is rate-limiting requests; wait and retry, and reduce "
                     "the request rate.",
                 )
-            if status in (401, 403):
-                raise BugTicketError(
-                    "invalid_credentials",
-                    creds_hint or "Authentication failed; check your tracker credentials.",
-                )
-            if status == 404:
-                raise BugTicketError(
-                    "not_found",
-                    notfound_hint or "The requested project/repository was not found.",
-                )
-            if 300 <= status < 400:
-                # We deliberately do not follow redirects (see allow_redirects above).
-                # A redirect almost always means base_url is wrong (e.g. http->https
-                # upgrade, trailing-host change), so fail with a clear remediation.
-                raise BugTicketError(
-                    "tracker_redirect",
-                    f"Tracker responded with a redirect (HTTP {status}); redirects are "
-                    "not followed. Check base_url points directly at the tracker API.",
-                )
-            if status >= 400:
-                raise BugTicketError(
-                    "tracker_error",
-                    f"Tracker returned HTTP {status}. {_echo(_short_body(resp))}",
-                )
-            return resp
+            return _raise_for_status(resp, creds_hint=creds_hint, notfound_hint=notfound_hint)
 
         if attempt < _MAX_RETRIES:
             time.sleep(_backoff(attempt))
@@ -232,16 +246,19 @@ def _http(
     raise BugTicketError("tracker_unreachable", f"The tracker request failed ({kind}); check connectivity.")
 
 
+def _sanitize_echo(text: str, limit: int = 200) -> str:
+    """Make untrusted text safe to echo into a remediation: scrub control chars,
+    collapse whitespace, and clip. Shared by every place that surfaces tracker text."""
+    return " ".join(_CONTROL_CHARS.sub(" ", text).split())[:limit]
+
+
 def _short_body(resp: requests.Response, limit: int = 200) -> str:
     try:
         text = resp.text or ""
     except Exception:
         return ""
-    # Scrub control characters and collapse whitespace: the body is untrusted and
-    # is echoed into a remediation, so it must be inert opaque data.
-    text = _CONTROL_CHARS.sub(" ", text)
-    text = " ".join(text.split())
-    return text[:limit]
+    # The body is untrusted and is echoed into a remediation, so sanitize it.
+    return _sanitize_echo(text, limit)
 
 
 def _echo(body: str) -> str:
@@ -368,10 +385,8 @@ class LinearClient:
         body = _json_body(resp)
         errors = body.get("errors")
         if errors:
-            # Scrub control chars from the (untrusted) GraphQL error text before it
-            # is echoed into a remediation, mirroring _short_body for HTTP bodies.
-            msg = _CONTROL_CHARS.sub(" ", "; ".join(str(e.get("message", e)) for e in errors))
-            msg = " ".join(msg.split())[:200]
+            # GraphQL error text is untrusted and echoed into a remediation -> sanitize.
+            msg = _sanitize_echo("; ".join(str(e.get("message", e)) for e in errors))
             # Linear reports auth failures as GraphQL errors with HTTP 200. Detect
             # via the structured error extensions (type/code) when present — the
             # message text is not contractual — falling back to message keywords.

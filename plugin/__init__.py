@@ -42,13 +42,48 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-def _error(error: str, remediation: str, **extra: Any) -> str:
-    return _json({"success": False, "error": error, "remediation": remediation, **extra})
-
-
 def _short(text: str | None) -> str:
     text = (text or "").strip()
     return text if len(text) <= _SUMMARY_MAX else text[: _SUMMARY_MAX - 1] + "…"
+
+
+def _deduped_result(target: str, ticket_url: str, title: str) -> dict[str, Any]:
+    return {
+        "success": True,
+        "deduped": True,
+        "target": target,
+        "ticket_url": ticket_url,
+        "title": title,
+        "message": "An open ticket with this title already exists; "
+                   "no duplicate was created.",
+    }
+
+
+def _preview_result(target: str, project: str, title: str, report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": True,
+        "preview": True,
+        "requires_confirmation": True,
+        "target": target,
+        "project": project,
+        "title": title,
+        "severity": report.get("severity"),
+        "summary": _short(report.get("summary")),
+        "message": "Preview only — no ticket was created. Re-invoke with "
+                   "confirm=true to file it.",
+    }
+
+
+def _created_result(target: str, created: dict[str, Any], title: str, report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": True,
+        "created": True,
+        "target": target,
+        "ticket_url": created.get("url", ""),
+        "ticket_id": created.get("id", ""),
+        "title": title,
+        "summary": _short(report.get("summary")),
+    }
 
 
 def _confirmed(args: dict[str, Any]) -> bool:
@@ -110,51 +145,24 @@ def _run_pipeline(ctx, args: dict[str, Any]) -> str:
         if dedup is not None:
             existing = client.find_duplicate(dedup)
             if existing:
-                return _json({
-                    "success": True,
-                    "deduped": True,
-                    "target": target,
-                    "ticket_url": existing,
-                    "title": title,
-                    "message": "An open ticket with this title already exists; "
-                               "no duplicate was created.",
-                })
+                return _json(_deduped_result(target, existing, title))
 
         # 6. Preview (safe default) vs. create.
         if not confirm:
-            return _json({
-                "success": True,
-                "preview": True,
-                "requires_confirmation": True,
-                "target": target,
-                "project": project,
-                "title": title,
-                "severity": report.get("severity"),
-                "summary": _short(report.get("summary")),
-                "message": "Preview only — no ticket was created. Re-invoke with "
-                           "confirm=true to file it.",
-            })
+            return _json(_preview_result(target, project, title, report))
 
         created = client.create_issue(project, mapped["create_payload"])
-        return _json({
-            "success": True,
-            "created": True,
-            "target": target,
-            "ticket_url": created.get("url", ""),
-            "ticket_id": created.get("id", ""),
-            "title": title,
-            "summary": _short(report.get("summary")),
-        })
+        return _json(_created_result(target, created, title, report))
 
     except BugTicketError as exc:
         return _json(exc.to_payload())
     except Exception:  # noqa: BLE001 — tool handlers must not crash the agent loop
         logger.exception("report_bug_from_screenshot failed unexpectedly")
-        return _error(
+        return _json(BugTicketError(
             "internal_error",
             "The plugin hit an unexpected error. Check the image path and "
             "~/.hermes/bug-tickets.yaml, then retry.",
-        )
+        ).to_payload())
 
 
 def _approval_required() -> bool:

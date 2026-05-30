@@ -88,27 +88,27 @@ def _template_context(bug_report: dict[str, Any], project: str) -> dict[str, str
     }
 
 
-def _expand_str(template: str, ctx: dict[str, str]) -> str:
+def _expand_str(template: str, tmpl_ctx: dict[str, str]) -> str:
     def repl(m: "re.Match[str]") -> str:
         key = m.group(1)
-        if key not in ctx:
+        if key not in tmpl_ctx:
             raise BugTicketError(
                 "missing_placeholder",
                 f"Template references unknown placeholder '{{{key}}}'. Known: "
-                f"{', '.join(sorted(ctx))}.",
+                f"{', '.join(sorted(tmpl_ctx))}.",
             )
-        return ctx[key]
+        return tmpl_ctx[key]
 
     return _PLACEHOLDER.sub(repl, template)
 
 
-def _expand_value(value: Any, ctx: dict[str, str]) -> Any:
+def _expand_value(value: Any, tmpl_ctx: dict[str, str]) -> Any:
     if isinstance(value, str):
-        return _expand_str(value, ctx)
+        return _expand_str(value, tmpl_ctx)
     if isinstance(value, list):
-        return [_expand_value(v, ctx) for v in value]
+        return [_expand_value(v, tmpl_ctx) for v in value]
     if isinstance(value, dict):
-        return {k: _expand_value(v, ctx) for k, v in value.items()}
+        return {k: _expand_value(v, tmpl_ctx) for k, v in value.items()}
     return value
 
 
@@ -284,7 +284,9 @@ def _guard_reserved(extra: dict[str, Any], reserved: frozenset, source: str, tar
 # ---------------------------------------------------------------------------
 # Per-target payload builders
 # ---------------------------------------------------------------------------
-def _jira_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
+def _jira_payload(
+    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "project": {"key": project},
         "issuetype": {"name": cfg.get("issue_type", "Bug")},
@@ -299,15 +301,20 @@ def _jira_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
     _guard_reserved(severity_entry, _JIRA_RESERVED, "severity_map entry", "jira")
     fields.update(severity_entry)
 
+    # custom_fields is Jira-only: Jira issues accept arbitrary field keys, so we
+    # expand {placeholder}s into them. Linear/GitHub have fixed create shapes and
+    # deliberately do NOT honor custom_fields (see their builders).
     custom_fields = cfg.get("custom_fields") or {}
     _guard_reserved(custom_fields, _JIRA_RESERVED, "custom_fields", "jira")
     for key, value in custom_fields.items():
-        fields[key] = _expand_value(value, ctx)
+        fields[key] = _expand_value(value, tmpl_ctx)
 
     return {"fields": fields}
 
 
-def _linear_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
+def _linear_payload(
+    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "teamId": project,
         "title": bug_report["title"],
@@ -317,6 +324,8 @@ def _linear_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
     _guard_reserved(severity_entry, _LINEAR_RESERVED, "severity_map entry", "linear")
     payload.update(severity_entry)
 
+    # No custom_fields support here: Linear's issueCreate takes a fixed input shape
+    # (+ labelIds), not arbitrary keys, so only Jira maps custom_fields.
     # Linear's issueCreate takes labelIds (UUIDs), NOT display-name labels, so only
     # honor label_ids — never fall back to the generic `labels` key (which would put
     # names where Linear expects UUIDs and fail the mutation with an opaque error).
@@ -326,7 +335,11 @@ def _linear_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
     return payload
 
 
-def _github_payload(bug_report, cfg, project, ctx) -> dict[str, Any]:
+def _github_payload(
+    bug_report: dict[str, Any], cfg: dict[str, Any], project: str, tmpl_ctx: dict[str, str]
+) -> dict[str, Any]:
+    # No custom_fields support here: a GitHub issue is title/body/labels only, so
+    # only Jira maps custom_fields. Severity contributes labels (below).
     labels: list[str] = [str(x) for x in (cfg.get("default_labels") or [])]
     entry = _severity_entry(cfg, bug_report["severity"], "github_issues")
     for label in entry.get("labels", []) or []:
@@ -370,8 +383,8 @@ def to_payload(
         raise BugTicketError("missing_title", "BugReport has no title to file.")
 
     resolved = _resolve_project(target, target_cfg, project)
-    ctx = _template_context(bug_report, resolved)
-    create_payload = _BUILDERS[target](bug_report, target_cfg, resolved, ctx)
+    tmpl_ctx = _template_context(bug_report, resolved)
+    create_payload = _BUILDERS[target](bug_report, target_cfg, resolved, tmpl_ctx)
 
     return {
         "target": target,
@@ -409,9 +422,9 @@ def build_dedup(
         # for a DOUBLE-QUOTED JQL string literal (see _jql_escape). The jql_template
         # MUST place each {placeholder} inside double quotes (e.g. summary ~
         # "{title}") — the escaping only protects a quoted position.
-        ctx = _template_context(bug_report, project)
-        ctx = {k: _jql_escape(v) for k, v in ctx.items()}
-        return {"kind": "jql", "jql": _expand_str(template, ctx).strip()}
+        tmpl_ctx = _template_context(bug_report, project)
+        tmpl_ctx = {k: _jql_escape(v) for k, v in tmpl_ctx.items()}
+        return {"kind": "jql", "jql": _expand_str(template, tmpl_ctx).strip()}
 
     if target == "github_issues":
         template = dedup.get("search_template")
@@ -421,10 +434,10 @@ def build_dedup(
         # qualifiers (e.g. a second `repo:` or `is:open`); strip the qualifier
         # delimiter ':' and quotes from non-structural fields. The expected title is
         # also returned so the client can verify the matched issue (see find_duplicate).
-        ctx = _github_search_safe(_template_context(bug_report, project))
+        tmpl_ctx = _github_search_safe(_template_context(bug_report, project))
         return {
             "kind": "github_search",
-            "q": _expand_str(template, ctx).strip(),
+            "q": _expand_str(template, tmpl_ctx).strip(),
             "title": (bug_report.get("title") or "").strip(),
         }
 
@@ -446,7 +459,7 @@ def _jql_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _github_search_safe(ctx: dict[str, str]) -> dict[str, str]:
+def _github_search_safe(tmpl_ctx: dict[str, str]) -> dict[str, str]:
     """Neutralize GitHub-search syntax in untrusted free-text context values.
 
     Structural keys (the validated project, in its various aliases) pass through;
@@ -454,7 +467,7 @@ def _github_search_safe(ctx: dict[str, str]) -> dict[str, str]:
     qualifier tokens degrade to plain search terms. Mirrors the JQL escaping above.
     """
     safe: dict[str, str] = {}
-    for key, value in ctx.items():
+    for key, value in tmpl_ctx.items():
         if key in _GH_STRUCTURAL_KEYS:
             safe[key] = value
         else:

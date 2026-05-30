@@ -150,7 +150,12 @@ def load_config() -> dict[str, Any]:
         )
 
     data = _expand_env(data)
+    _validate_targets(data, path)
+    return data
 
+
+def _validate_targets(data: dict[str, Any], path: Path) -> None:
+    """Validate the 'targets' section: present, non-empty, known names, mapping values."""
     targets = data.get("targets")
     if not isinstance(targets, dict) or not targets:
         raise BugTicketError(
@@ -169,8 +174,6 @@ def load_config() -> dict[str, Any]:
                 "config_invalid_target",
                 f"Target '{name}' in {path} must be a mapping of settings.",
             )
-
-    return data
 
 
 def resolve_target_name(cfg: dict[str, Any], requested: str | None) -> str:
@@ -204,7 +207,28 @@ def resolve_target_name(cfg: dict[str, Any], requested: str | None) -> str:
     )
 
 
+def _as_bool(value: Any, *, default: bool) -> bool:
+    """Interpret a YAML/config value as a bool, tolerant of quoted strings.
+
+    A quoted "false"/"no"/"0"/"off" parses as a *string*, which a naive bool()
+    reads as True — for an approval gate that would silently flip it open. This
+    mirrors the strict string handling in __init__._confirmed. Unrecognized or
+    absent values fall back to ``default``.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("true", "yes", "1", "on"):
+            return True
+        if token in ("false", "no", "0", "off", ""):
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    return default
+
+
 def require_approval(cfg: dict[str, Any]) -> bool:
-    """Whether ticket creation must be confirmed (default True)."""
-    val = cfg.get("require_approval", True)
-    return bool(val)
+    """Whether ticket creation must be confirmed (default True; quoted 'false' respected)."""
+    return _as_bool(cfg.get("require_approval"), default=True)
