@@ -23,11 +23,12 @@ Tests monkeypatch ``clients.requests.request`` — no real network.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -41,6 +42,36 @@ _RETRYABLE_STATUS = {500, 502, 503, 504}
 # Control chars (incl. C1) are scrubbed from any tracker body we echo back: the body
 # is untrusted/attacker-influenceable and ends up in a remediation string.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _check_request_host(url: str) -> None:
+    """Refuse a request whose host is a loopback/link-local IP literal (SSRF).
+
+    The Linear/GitHub hosts are fixed public endpoints; the only operator-tunable
+    host is the Jira ``base_url``. We can't fully prevent a malicious config from
+    pointing at an internal host (and self-hosted Jira legitimately lives on
+    private/RFC1918 addresses, so blocking those would break real deployments),
+    but loopback (127.0.0.0/8, ::1) and link-local (169.254.0.0/16 — incl. the
+    cloud metadata endpoint 169.254.169.254, fe80::/10) are NEVER a legitimate
+    tracker and are the classic SSRF targets, so we hard-block those literals.
+
+    Only IP *literals* are checked — a hostname that resolves to a blocked range
+    (DNS rebinding) is out of scope here; the operator-trusted config threat model
+    plus allow_redirects=False (below) make literal-blocking the proportionate guard.
+    """
+    host = (urlsplit(url).hostname or "").strip()
+    if not host:
+        return
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # a hostname, not an IP literal -> allowed (not resolved here)
+    if ip.is_loopback or ip.is_link_local:
+        raise BugTicketError(
+            "blocked_host",
+            f"Refusing a request to {host!r}: loopback/link-local addresses are not "
+            "permitted tracker hosts. Point base_url at the tracker's real host.",
+        )
 
 
 def _require_env(name: str) -> str:
@@ -114,6 +145,7 @@ def _http(
             "insecure_url",
             f"Refusing a non-HTTPS request to {url!r}; tracker URLs must use https://.",
         )
+    _check_request_host(url)
 
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES + 1):
@@ -126,6 +158,11 @@ def _http(
                 json=json_body,
                 auth=auth,
                 timeout=timeout,
+                # Do not follow redirects: these REST/GraphQL APIs never need them,
+                # and a redirect could bounce an authenticated request to an
+                # unexpected (e.g. internal) host. Keeps the request on the
+                # https-validated, host-checked URL we constructed.
+                allow_redirects=False,
             )
         except requests.exceptions.Timeout as exc:
             last_exc = exc
@@ -167,10 +204,19 @@ def _http(
                     "not_found",
                     notfound_hint or "The requested project/repository was not found.",
                 )
+            if 300 <= status < 400:
+                # We deliberately do not follow redirects (see allow_redirects above).
+                # A redirect almost always means base_url is wrong (e.g. http->https
+                # upgrade, trailing-host change), so fail with a clear remediation.
+                raise BugTicketError(
+                    "tracker_redirect",
+                    f"Tracker responded with a redirect (HTTP {status}); redirects are "
+                    "not followed. Check base_url points directly at the tracker API.",
+                )
             if status >= 400:
                 raise BugTicketError(
                     "tracker_error",
-                    f"Tracker returned HTTP {status}. {_short_body(resp)}",
+                    f"Tracker returned HTTP {status}. {_echo(_short_body(resp))}",
                 )
             return resp
 
@@ -198,6 +244,19 @@ def _short_body(resp: requests.Response, limit: int = 200) -> str:
     return text[:limit]
 
 
+def _echo(body: str) -> str:
+    """Wrap an echoed tracker message with an explicit untrusted marker.
+
+    The body/message is attacker-influenceable (a malicious or compromised
+    tracker can put arbitrary natural-language text in it) and ends up in a
+    ``remediation`` string handed back to the agent — a second-order prompt-
+    injection channel. Control chars are already scrubbed in ``_short_body``;
+    this prefix tells the reader (and the agent) the content is data, not
+    instructions to follow.
+    """
+    return f"[untrusted tracker output] {body}" if body else ""
+
+
 def _json_body(resp: requests.Response) -> dict[str, Any]:
     """Parse a JSON object body, mapping a non-JSON 2xx response to a clean error.
 
@@ -211,7 +270,7 @@ def _json_body(resp: requests.Response) -> dict[str, Any]:
     except ValueError as exc:
         raise BugTicketError(
             "tracker_error",
-            f"Tracker returned a non-JSON {resp.status_code} response. {_short_body(resp)}",
+            f"Tracker returned a non-JSON {resp.status_code} response. {_echo(_short_body(resp))}",
         ) from exc
     return data if isinstance(data, dict) else {}
 
@@ -309,7 +368,10 @@ class LinearClient:
         body = _json_body(resp)
         errors = body.get("errors")
         if errors:
-            msg = "; ".join(str(e.get("message", e)) for e in errors)[:200]
+            # Scrub control chars from the (untrusted) GraphQL error text before it
+            # is echoed into a remediation, mirroring _short_body for HTTP bodies.
+            msg = _CONTROL_CHARS.sub(" ", "; ".join(str(e.get("message", e)) for e in errors))
+            msg = " ".join(msg.split())[:200]
             # Linear reports auth failures as GraphQL errors with HTTP 200. Detect
             # via the structured error extensions (type/code) when present — the
             # message text is not contractual — falling back to message keywords.
@@ -324,7 +386,7 @@ class LinearClient:
                           "forbidden", "invalid api key", "api key")
             ):
                 raise BugTicketError("invalid_credentials", self._CREDS)
-            raise BugTicketError("tracker_error", f"Linear API error: {msg}")
+            raise BugTicketError("tracker_error", f"Linear API error: {_echo(msg)}")
         return body.get("data") or {}
 
     def find_duplicate(self, dedup: dict[str, Any]) -> str | None:

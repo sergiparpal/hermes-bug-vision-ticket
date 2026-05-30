@@ -51,6 +51,29 @@ def _short(text: str | None) -> str:
     return text if len(text) <= _SUMMARY_MAX else text[: _SUMMARY_MAX - 1] + "…"
 
 
+def _confirmed(args: dict[str, Any]) -> bool:
+    """Strictly interpret the ``confirm`` flag — the creation/approval gate.
+
+    The host does NOT validate or coerce tool-call arguments against the tool's
+    parameter schema (``agent/tool_executor.py`` does a bare ``json.loads`` and
+    only checks the result is a dict), so whatever the model emits arrives here
+    verbatim. A naive ``bool(args.get("confirm"))`` would treat the *string*
+    ``"false"`` / ``"no"`` / ``"0"`` as True (any non-empty string is truthy),
+    failing BOTH the preview default and the pre_tool_call approval gate OPEN.
+    Only an explicit affirmative confirms; anything negative/ambiguous does not.
+    Both the handler and the hook route through this single helper so they can
+    never diverge.
+    """
+    val = args.get("confirm")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "yes", "1")
+    if isinstance(val, (int, float)):
+        return val == 1
+    return False
+
+
 def _run_pipeline(ctx, args: dict[str, Any]) -> str:
     """Run the full report-a-bug pipeline and return a bounded JSON string.
 
@@ -61,7 +84,7 @@ def _run_pipeline(ctx, args: dict[str, Any]) -> str:
     from .errors import BugTicketError
 
     args = args if isinstance(args, dict) else {}
-    confirm = bool(args.get("confirm"))
+    confirm = _confirmed(args)
 
     try:
         # 1. Cheap, direct input validation first (no LLM, no network). Keep the
@@ -156,7 +179,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_kwargs: Any) -> 
     if tool_name != TOOL_NAME:
         return None
     args = args if isinstance(args, dict) else {}
-    if args.get("confirm"):
+    if _confirmed(args):
         return None  # explicit confirmation present -> allow creation
     if not _approval_required():
         return None  # approval disabled in config -> allow (handler still previews)

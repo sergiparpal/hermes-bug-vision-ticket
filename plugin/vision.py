@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -258,11 +259,28 @@ def extract_bug_report(
 
     # Bounded read of the validated path: read at most the cap (+1 to detect
     # overflow) from a single handle so a file swapped after resolve_image's stat
-    # can't make us read an unbounded / much larger file into memory.
+    # can't make us read an unbounded / much larger file into memory. Open with
+    # O_NONBLOCK and require a regular file via fstat BEFORE reading, so a path
+    # swapped to a FIFO/device after validation (TOCTOU) can neither block the open
+    # nor be read as a stream.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
-        with open(path, "rb") as fh:
-            data = fh.read(_MAX_IMAGE_BYTES + 1)
+        fd = os.open(path, flags)
     except OSError as exc:
+        raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BugTicketError("image_not_a_file", f"{path} is not a regular file.")
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read(_MAX_IMAGE_BYTES + 1)
+    except BugTicketError:
+        os.close(fd)  # fstat rejected it before fdopen took ownership of the fd
+        raise
+    except OSError as exc:
+        try:
+            os.close(fd)  # may already be closed if fdopen's context manager ran
+        except OSError:
+            pass
         raise BugTicketError("image_unreadable", f"Could not read {path}: {exc}") from exc
     if len(data) > _MAX_IMAGE_BYTES:
         raise BugTicketError(

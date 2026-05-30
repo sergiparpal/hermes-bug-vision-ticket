@@ -7,6 +7,8 @@ placeholder, unmapped severity, unknown target, missing project.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from hermes_plugins.hermes_bug_vision_ticket import mapping
@@ -289,3 +291,56 @@ def test_observed_fields_rendered_into_body():
     assert "Affected component: settings-page" in body
     assert "## Observed UI elements" in body and "Save button" in body
     assert "Text observed in screenshot" in body and "Save" in body
+
+
+# --- F3: JQL control-char stripping (defense-in-depth) ----------------------
+def test_jira_dedup_strips_control_chars():
+    # Newlines / control chars have no place in a one-line JQL literal and are a
+    # multiline-breakout aid; they must be stripped (each -> one space).
+    bug = dict(BUG, title="a\x00b\nc\td")
+    d = mapping.build_dedup(bug, "jira", JIRA_CFG, "ENG")
+    assert "\n" not in d["jql"] and "\t" not in d["jql"] and "\x00" not in d["jql"]
+    assert 'summary ~ "a b c d"' in d["jql"]
+
+
+# --- F4: untrusted body text is Markdown-escaped (GitHub/Linear), ADF is not -
+def test_github_body_defangs_markdown_beacon():
+    # A crafted screenshot whose OCR'd text is an image beacon / link must render
+    # as inert text in the issue body (the '[', ']', '!' are escaped).
+    bug = dict(BUG, visible_text=["![x](http://attacker/leak.png)", "[click](http://evil)"])
+    body = mapping.to_payload(bug, "github_issues", GITHUB_CFG)["create_payload"]["body"]
+    assert "![x](http://attacker/leak.png)" not in body  # raw beacon not present
+    assert "\\!\\[x\\](http://attacker/leak.png)" in body  # escaped form present
+    assert "\\[click\\](http://evil)" in body
+
+
+def test_linear_body_defangs_inline_html_and_code():
+    bug = dict(BUG, summary="<img src=x onerror=1> and `code`")
+    body = mapping.to_payload(bug, "linear", LINEAR_CFG)["create_payload"]["description"]
+    # The escaped forms are present (so the HTML/code render inert)...
+    assert "\\<img src=x onerror=1\\>" in body
+    assert "\\`code\\`" in body
+    # ...and no unescaped '<' or '`' survives (every one is backslash-prefixed).
+    assert not re.search(r"(?<!\\)<", body)
+    assert not re.search(r"(?<!\\)`", body)
+
+
+def test_jira_adf_text_is_not_escaped():
+    # The ADF path places text in inert text nodes, so it must be the RAW string
+    # (escaping there would inject literal backslashes into Jira).
+    bug = dict(BUG, summary="brackets [x] and <html> stay raw")
+    adf = mapping.to_payload(bug, "jira", JIRA_CFG)["create_payload"]["fields"]["description"]
+    texts = _adf_texts(adf)
+    assert "brackets [x] and <html> stay raw" in texts
+    assert not any("\\[" in t or "\\<" in t for t in texts)
+
+
+def _adf_texts(node):
+    """Collect every ADF text-node string (recursively)."""
+    out = []
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            out.append(node.get("text", ""))
+        for child in node.get("content", []) or []:
+            out.extend(_adf_texts(child))
+    return out

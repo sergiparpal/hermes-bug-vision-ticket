@@ -360,3 +360,69 @@ def test_unknown_target():
     with pytest.raises(BugTicketError) as ei:
         clients.make_client("trello", {})
     assert ei.value.error == "unknown_target"
+
+
+# --- F2: SSRF hardening -----------------------------------------------------
+def test_redirects_disabled_on_every_request(creds, monkeypatch):
+    # allow_redirects must be False so an authenticated request can't be bounced
+    # to an unexpected (e.g. internal) host.
+    def handler(method, url, calls, **kw):
+        assert kw.get("allow_redirects") is False
+        return FakeResp(201, {"html_url": "https://github.com/acme/web/issues/1", "number": 1})
+
+    patch_request(monkeypatch, handler)
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    client.create_issue("acme/web", {"title": "t"})
+
+
+def test_redirect_response_is_tracker_redirect(creds, monkeypatch):
+    # A 3xx (not followed) maps to a clear, distinct error rather than a confusing
+    # non-JSON parse failure.
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(302, headers={"Location": "https://evil.example"}))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert ei.value.error == "tracker_redirect"
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "[::1]"])
+def test_loopback_and_link_local_hosts_blocked(creds, monkeypatch, host):
+    # Loopback / link-local (incl. the cloud metadata endpoint) are never a real
+    # tracker; a base_url pointing there must be refused before any request.
+    calls = patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, {"issues": []}))
+    client = clients.make_client("jira", {"base_url": f"https://{host}"})
+    with pytest.raises(BugTicketError) as ei:
+        client.find_duplicate({"kind": "jql", "jql": "project = ENG"})
+    assert ei.value.error == "blocked_host"
+    assert not calls  # never reached the network
+
+
+def test_public_ip_host_is_allowed(creds, monkeypatch):
+    # A public IP literal is not in the blocked ranges (self-hosted trackers exist),
+    # so it must pass the host check (regression: don't over-block).
+    def handler(method, url, calls, **kw):
+        return FakeResp(200, {"issues": []})
+
+    patch_request(monkeypatch, handler)
+    client = clients.make_client("jira", {"base_url": "https://8.8.8.8"})
+    assert client.find_duplicate({"kind": "jql", "jql": "project = ENG"}) is None
+
+
+# --- F5: echoed tracker output marked untrusted -----------------------------
+def test_echoed_body_marked_untrusted(creds, monkeypatch):
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(422, text="boom from tracker"))
+    client = clients.make_client("github_issues", {"repo": "acme/web"})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("acme/web", {"title": "t"})
+    assert "[untrusted tracker output]" in ei.value.remediation
+    assert "boom from tracker" in ei.value.remediation
+
+
+def test_linear_error_message_marked_untrusted(creds, monkeypatch):
+    body = {"errors": [{"message": "Field 'foo' is not defined"}]}
+    patch_request(monkeypatch, lambda m, u, c, **k: FakeResp(200, body))
+    client = clients.make_client("linear", {})
+    with pytest.raises(BugTicketError) as ei:
+        client.create_issue("team-1", {"teamId": "team-1", "title": "t"})
+    assert ei.value.error == "tracker_error"
+    assert "[untrusted tracker output]" in ei.value.remediation

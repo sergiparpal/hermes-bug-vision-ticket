@@ -47,7 +47,11 @@ image_path → validate → load config → resolve target + credentials
 ## Configuration — `~/.hermes/bug-tickets.yaml`
 
 Secrets are **never** stored here; tokens come from environment variables.
-String values may reference env vars with `${VAR}` (expanded at load).
+String values may reference env vars with `${VAR}` (expanded at load) — use this
+only for **non-secret structure** (e.g. a base URL). A `${VAR}` whose name is one of
+the tracker credentials *or* simply looks like a secret (contains `TOKEN`, `SECRET`,
+`PASSWORD`, `KEY`, `CREDENTIAL`, …) expands to an empty string, so a secret can
+never be copied into a ticket payload.
 
 ```yaml
 default_target: github_issues   # used when the tool is called without target=
@@ -108,7 +112,11 @@ targets:
   `confidence`, `component_hint`, `expected_behavior`, `actual_behavior`, plus
   `project` / `project_key` / `team_id` / `repo`. An unknown placeholder is an error.
   In GitHub `search_template`, untrusted free-text is sanitized so it cannot inject
-  search qualifiers.
+  search qualifiers. In a Jira `jql_template`, every `{placeholder}` **must sit
+  inside a double-quoted JQL literal** (e.g. `summary ~ "{title}"`, as in the
+  example above): interpolated values are escaped for a quoted position (quotes and
+  backslashes escaped, control chars/newlines stripped), so an **unquoted**
+  placeholder would not be safe against injection.
 - **`dedup`** is checked before creating; if a match is found (for GitHub/Linear,
   only when the existing issue's **title matches**) the existing ticket URL is
   returned and nothing new is created (idempotent re-runs).
@@ -135,7 +143,10 @@ structured `remediation` error at call time (the plugin still loads).
 Creating a ticket is a side effect, so it is gated two ways:
 
 1. **`confirm` flag** — the handler never POSTs unless `confirm=true`. The default
-   call returns a non-destructive **preview** of the proposed ticket.
+   call returns a non-destructive **preview** of the proposed ticket. `confirm` is
+   interpreted strictly (only an explicit affirmative — boolean `true`, or the
+   strings `"true"`/`"yes"`/`"1"` — confirms), so a stringified `"false"` can't
+   slip the gate open since the host does not coerce tool args to the schema type.
 2. **`pre_tool_call` hook** — when `require_approval: true` (the default), an
    unconfirmed call is **blocked** with a message telling the operator to
    re-invoke with `confirm=true`. Set `require_approval: false` to rely on the
@@ -177,19 +188,29 @@ not sandboxed). It can:
 
 - **Read one local file** — the screenshot at `image_path`. The path is resolved
   with `os.path.realpath` and validated (must exist, be a regular file, have a
-  supported image extension, and be ≤ 15 MiB) before it is read as bytes.
+  supported image extension, and be ≤ 15 MiB) before it is read as bytes. The read
+  itself opens the file non-blocking and re-confirms it is a regular file (so a path
+  swapped to a FIFO/device after validation can neither block nor be streamed).
 - **Send the image to the active LLM** — via the host's `ctx.llm`. The screenshot
   bytes are transmitted to whatever model/provider the user has configured.
 - **Make authenticated HTTPS writes to your issue tracker** — it reads tracker
   tokens from environment variables (only when a tracker is used) and creates
   issues. Every request is HTTPS-only with an explicit timeout and bounded retries
-  (never on 4xx). Tokens are never logged or echoed in errors.
+  (never on 4xx). **Redirects are not followed**, and a `base_url` resolving to a
+  loopback/link-local IP literal (incl. the cloud-metadata endpoint) is refused, so
+  an authenticated request can't be bounced to an internal host. Tokens are never
+  logged or echoed in errors.
 - It does **not** write any files, run any subprocess, or read any other
   credentials. The config file is read-only (the plugin never creates it).
 
 LLM output is treated as **untrusted**: the extracted report is re-validated
 against a JSON schema before use, and the system prompt instructs the model to
 never obey instructions embedded in the screenshot (prompt-injection defense).
+Untrusted strings are escaped/neutralized before they reach a tracker: Markdown
+metacharacters that form links/image beacons, inline HTML, or code are escaped in
+GitHub/Linear issue bodies; JQL and GitHub-search values are escaped/sanitized; and
+any tracker-returned message echoed back into an error is scrubbed of control chars
+and clearly marked `[untrusted tracker output]`.
 
 ---
 

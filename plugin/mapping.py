@@ -26,6 +26,25 @@ from .schemas import SUPPORTED_TARGETS
 _PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 _JIRA_SUMMARY_MAX = 255
 
+# Control chars / newlines have no place in a one-line JQL string literal and are a
+# multiline-breakout aid, so they are stripped from interpolated (untrusted) values
+# before the backslash/quote escaping in build_dedup. NOTE: placeholders in a
+# jql_template MUST sit inside a double-quoted literal (e.g. summary ~ "{title}") —
+# the quote/backslash escaping only protects a quoted position; an unquoted
+# placeholder is unsafe regardless of escaping. See build_dedup + README.
+_JQL_STRIP = re.compile(r"[\x00-\x1f\x7f]")
+
+# Markdown metacharacters escaped in UNTRUSTED, OCR-derived body text so a crafted
+# screenshot cannot inject the high-impact constructs into a GitHub/Linear issue
+# body: links / image beacons (need '[' ']' '!'), inline HTML ('<' '>'), and code
+# spans ('`'); '\' is escaped first so our own escaping can't be subverted. These
+# are GFM/CommonMark escapable punctuation, so they render literally with no visible
+# backslash. We deliberately do NOT escape '.', '-', '*', '_', '#', etc.: escaping
+# them would add backslash noise to ordinary prose, and the residue they'd address
+# (bare-URL autolinks, cosmetic emphasis/headings) is visible + click-gated, not a
+# beacon. (The Jira ADF path renders text nodes verbatim and is inert -> not escaped.)
+_MD_ESCAPE = re.compile(r"([\\`\[\]<>!])")
+
 # A Jira project key must be safe to drop into an UNQUOTED JQL position (the
 # standard dedup template uses `project = {project_key}`), where the quoted-literal
 # escaper does nothing — so restrict it to letters/digits/underscore.
@@ -134,9 +153,16 @@ def _sections(bug_report: dict[str, Any]) -> list[dict[str, Any]]:
     sections.append({
         "heading": None,
         "kind": "para",
+        # Plugin-authored, not model text -> trusted -> rendered without Markdown escaping.
+        "trusted": True,
         "content": f"Filed from a screenshot via hermes-bug-vision-ticket (model confidence: {confidence}).",
     })
     return sections
+
+
+def _md_escape(text: str) -> str:
+    """Backslash-escape Markdown metacharacters in untrusted free text (see _MD_ESCAPE)."""
+    return _MD_ESCAPE.sub(r"\\\1", text)
 
 
 def _render_markdown(bug_report: dict[str, Any]) -> str:
@@ -144,10 +170,16 @@ def _render_markdown(bug_report: dict[str, Any]) -> str:
     for sec in _sections(bug_report):
         if sec["heading"]:
             out.append(f"## {sec['heading']}")
+        # Section content is untrusted (model-extracted from the screenshot) unless
+        # explicitly marked trusted (the plugin-authored footer); escape the former so
+        # injected Markdown renders as inert text in the GitHub/Linear issue body.
+        raw = bool(sec.get("trusted"))
         if sec["kind"] == "para":
-            out.append(sec["content"])
+            out.append(sec["content"] if raw else _md_escape(sec["content"]))
         else:
-            out.extend(f"- {item}" for item in sec["content"])
+            out.extend(
+                f"- {item if raw else _md_escape(item)}" for item in sec["content"]
+            )
         out.append("")
     return "\n".join(out).strip()
 
@@ -373,11 +405,12 @@ def build_dedup(
         template = dedup.get("jql_template")
         if not template:
             return None
-        # Every interpolated value (all model-extracted, hence untrusted) is
-        # escaped for a JQL string literal: backslash first, THEN double quote, so
-        # a trailing backslash can't terminate the literal early.
+        # Every interpolated value (all model-extracted, hence untrusted) is escaped
+        # for a DOUBLE-QUOTED JQL string literal (see _jql_escape). The jql_template
+        # MUST place each {placeholder} inside double quotes (e.g. summary ~
+        # "{title}") — the escaping only protects a quoted position.
         ctx = _template_context(bug_report, project)
-        ctx = {k: v.replace("\\", "\\\\").replace('"', '\\"') for k, v in ctx.items()}
+        ctx = {k: _jql_escape(v) for k, v in ctx.items()}
         return {"kind": "jql", "jql": _expand_str(template, ctx).strip()}
 
     if target == "github_issues":
@@ -399,6 +432,18 @@ def build_dedup(
         return {"kind": "linear", "title": bug_report.get("title", "")}
 
     return None
+
+
+def _jql_escape(value: str) -> str:
+    """Escape an untrusted value for a DOUBLE-QUOTED JQL string literal.
+
+    Strips control chars/newlines first (never valid in a one-line literal, and a
+    multiline-breakout aid), then escapes backslash FIRST and the double quote
+    SECOND so a trailing backslash can't terminate the literal early. Only safe in
+    a quoted position — jql_template placeholders must be quoted (see README).
+    """
+    value = _JQL_STRIP.sub(" ", value)
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _github_search_safe(ctx: dict[str, str]) -> dict[str, str]:

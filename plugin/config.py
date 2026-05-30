@@ -36,6 +36,16 @@ _SECRET_ENV_DENYLIST = frozenset(
     {"JIRA_API_TOKEN", "LINEAR_API_KEY", "GITHUB_TOKEN", "JIRA_EMAIL"}
 )
 
+# Defense-in-depth beyond the explicit denylist: refuse to expand ANY env var whose
+# name looks like a credential, so a stray ${AWS_SECRET_ACCESS_KEY} / ${DB_PASSWORD}
+# / ${SOME_API_TOKEN} can't be copied verbatim into a ticket payload. The explicit
+# denylist above still stands (it covers JIRA_EMAIL, which this heuristic would miss).
+# ${}-expansion is intended for non-secret structure (base URLs); document accordingly.
+_SECRET_NAME_HINT = re.compile(
+    r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|API_?KEY|ACCESS_KEY)",
+    re.IGNORECASE,
+)
+
 # Cache the RAW parsed YAML keyed on (mtime_ns, size): the approval hook and the
 # handler each load the config once per invocation, so this avoids a redundant
 # read+parse. Env expansion + validation are deliberately NOT cached — they re-run
@@ -59,8 +69,13 @@ def config_path() -> Path:
 
 
 def _expand_one(name: str) -> str:
-    """Expand a single ${VAR} ref, refusing credential vars (-> '')."""
-    if name in _SECRET_ENV_DENYLIST:
+    """Expand a single ${VAR} ref, refusing credential vars (-> '').
+
+    Refuses both the explicit credential denylist and any secret-looking name
+    (``_SECRET_NAME_HINT``) so a secret can never be interpolated into config and
+    thus into a ticket. Non-secret structural vars (e.g. JIRA_BASE_URL) expand.
+    """
+    if name in _SECRET_ENV_DENYLIST or _SECRET_NAME_HINT.search(name):
         return ""
     return os.environ.get(name, "")
 

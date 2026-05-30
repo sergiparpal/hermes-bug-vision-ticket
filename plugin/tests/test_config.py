@@ -165,6 +165,27 @@ def test_config_unreadable(home):
     assert ei.value.error == "config_unreadable"
 
 
+# --- F6: secret-name heuristic (defense beyond the explicit denylist) --------
+@pytest.mark.parametrize(
+    "var", ["MY_SERVICE_TOKEN", "AWS_SECRET_ACCESS_KEY", "DB_PASSWORD", "SOME_APIKEY", "X_PRIVATE_KEY"]
+)
+def test_secret_looking_env_var_not_expanded(home, monkeypatch, var):
+    # Any secret-looking name (not just the 4 explicit creds) must expand to ''
+    # so a stray ${...} can't copy a secret into a ticket.
+    monkeypatch.setenv(var, "leaked-secret-value")
+    _write(home, f"targets:\n  github_issues:\n    repo: a/b\n    default_labels: ['${{{var}}}']\n")
+    cfg = config.load_config()
+    assert cfg["targets"]["github_issues"]["default_labels"] == [""]
+
+
+def test_non_secret_env_var_still_expands(home, monkeypatch):
+    # The heuristic must not over-block ordinary structural vars.
+    monkeypatch.setenv("MY_REGION", "eu-west-1")
+    _write(home, "targets:\n  github_issues:\n    repo: a/b\n    custom_fields:\n      region: '${MY_REGION}'\n")
+    cfg = config.load_config()
+    assert cfg["targets"]["github_issues"]["custom_fields"]["region"] == "eu-west-1"
+
+
 def test_config_cache_reflects_file_changes(home, monkeypatch):
     # The raw-parse cache is keyed on (mtime_ns, size); rewriting the file must be
     # picked up, never serving stale parsed content.

@@ -300,15 +300,32 @@ def test_image_too_large_post_read_toctou(tmp_path, monkeypatch):
 
 def test_image_unreadable(tmp_path, monkeypatch):
     img = _png(tmp_path)
-    real_open = open
+    real_os_open = vision.os.open
 
-    def fake_open(file, mode="r", *a, **k):
-        if "bug.png" in str(file):
+    # The bounded read now opens via os.open (O_NONBLOCK + an fstat regular-file
+    # check for the FIFO/device TOCTOU defense), so simulate the failure there.
+    def fake_os_open(path, flags, *a, **k):
+        if "bug.png" in str(path):
             raise OSError("simulated unreadable")
-        return real_open(file, mode, *a, **k)
+        return real_os_open(path, flags, *a, **k)
 
-    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(vision.os, "open", fake_os_open)
     ctx = _FakeCtx(_FakeResult(parsed=dict(_FULL_REPORT)))
     with pytest.raises(BugTicketError) as ei:
         vision.extract_bug_report(ctx, str(img))
     assert ei.value.error == "image_unreadable"
+
+
+def test_read_rejects_non_regular_file(tmp_path):
+    # F8 TOCTOU defense: a validated path swapped to a FIFO/device must be rejected
+    # by the fstat regular-file check, never blocking the open or streamed as bytes.
+    if not hasattr(vision.os, "mkfifo"):
+        pytest.skip("mkfifo not available on this platform")
+    fifo = tmp_path / "bug.png"
+    vision.os.mkfifo(fifo)
+    ctx = _FakeCtx(_FakeResult(parsed=dict(_FULL_REPORT)))
+    # Pass resolved= to bypass resolve_image's own is_file() check and exercise the
+    # bounded-read guard directly (the O_NONBLOCK open + fstat in extract_bug_report).
+    with pytest.raises(BugTicketError) as ei:
+        vision.extract_bug_report(ctx, str(fifo), resolved=(fifo, "image/png"))
+    assert ei.value.error == "image_not_a_file"

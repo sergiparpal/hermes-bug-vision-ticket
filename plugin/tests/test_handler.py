@@ -308,3 +308,41 @@ def test_hook_blocks_on_invalid_config(env):
     (env["home"] / "bug-tickets.yaml").write_text("default_target: jira\n", encoding="utf-8")  # no targets
     res = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={})
     assert res is not None and res["action"] == "block"
+
+
+# --- F1: strict confirm parsing (the gate must not fail open on a non-boolean) ---
+@pytest.mark.parametrize("falsey", ["false", "False", "no", "0", "", "off", 0, False, None])
+def test_confirmed_rejects_non_affirmative(falsey):
+    # The host does NOT coerce tool args to the schema's types, so a stringified
+    # "false" would be truthy under a naive bool(); _confirmed must treat every
+    # non-affirmative value as NOT confirmed.
+    assert pkg._confirmed({"confirm": falsey}) is False
+
+
+@pytest.mark.parametrize("truthy", ["true", "True", "yes", "1", True, 1])
+def test_confirmed_accepts_affirmative(truthy):
+    assert pkg._confirmed({"confirm": truthy}) is True
+
+
+def test_string_false_confirm_does_not_create(env, monkeypatch):
+    # confirm="false" (a truthy string) must NOT create a ticket — it must preview.
+    calls = _route(monkeypatch, created_number=42)
+    out = _run(env, confirm="false")
+    assert out["success"] is True and out.get("preview") is True
+    assert not any(m == "POST" for m, u in calls)  # nothing created
+    assert not _unexpected(calls)
+
+
+def test_hook_blocks_string_false_confirm(env):
+    # The approval hook must also block confirm="false" (regression for the
+    # truthy-string fail-open).
+    res = pkg._on_pre_tool_call(tool_name=pkg.TOOL_NAME, args={"confirm": "false", "target": "github_issues"})
+    assert res is not None and res["action"] == "block"
+
+
+def test_string_true_confirm_creates(env, monkeypatch):
+    # A stringified "true" is a valid affirmative and should create.
+    calls = _route(monkeypatch, created_number=77)
+    out = _run(env, confirm="true")
+    assert out["success"] is True and out.get("created") is True
+    assert any(m == "POST" and u.endswith("/issues") for m, u in calls)
